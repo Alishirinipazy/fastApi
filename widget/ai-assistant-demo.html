@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<title>دستیار خرید هوشمند - نمونه</title>
+<style>
+  /* ============================================================
+     AI shopping assistant widget - self-contained, no build step.
+     Drop the <div id="ai-assistant-root">...</div> markup and the
+     <script> block at the bottom into any page of the real
+     customer-facing storefront. Configure API_BASE and (optionally)
+     getAuthToken() at the top of the script to match that site.
+     ============================================================ */
+  :root {
+    --ai-primary: #1a1a1a;
+    --ai-accent: #2f6f4f;
+    --ai-bg: #ffffff;
+    --ai-bubble-user: #1a1a1a;
+    --ai-bubble-user-text: #ffffff;
+    --ai-bubble-bot: #f2f1ee;
+    --ai-bubble-bot-text: #1a1a1a;
+    --ai-border: #e5e3de;
+    --ai-radius: 16px;
+    font-family: "Vazirmatn", "Tahoma", sans-serif;
+  }
+
+  body { margin: 0; background: #fafaf8; }
+
+  #ai-demo-page { max-width: 720px; margin: 60px auto; padding: 0 20px; color: #333; }
+  #ai-demo-page h1 { font-size: 22px; }
+  #ai-demo-page p { line-height: 1.9; color: #555; }
+
+  #ai-assistant-launcher {
+    position: fixed;
+    bottom: 24px;
+    left: 24px;
+    width: 60px;
+    height: 60px;
+    border-radius: 50%;
+    background: var(--ai-primary);
+    color: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    box-shadow: 0 8px 24px rgba(0,0,0,.2);
+    z-index: 9998;
+    transition: transform .15s ease;
+    border: none;
+  }
+  #ai-assistant-launcher:hover { transform: scale(1.06); }
+  #ai-assistant-launcher svg { width: 26px; height: 26px; }
+
+  #ai-assistant-panel {
+    position: fixed;
+    bottom: 96px;
+    left: 24px;
+    width: 360px;
+    max-width: calc(100vw - 32px);
+    height: 520px;
+    max-height: calc(100vh - 140px);
+    background: var(--ai-bg);
+    border-radius: var(--ai-radius);
+    box-shadow: 0 16px 48px rgba(0,0,0,.22);
+    display: none;
+    flex-direction: column;
+    overflow: hidden;
+    z-index: 9999;
+    border: 1px solid var(--ai-border);
+  }
+  #ai-assistant-panel.open { display: flex; }
+
+  #ai-assistant-header {
+    padding: 16px 18px;
+    background: var(--ai-primary);
+    color: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  #ai-assistant-header .title { font-size: 15px; font-weight: 700; }
+  #ai-assistant-header .subtitle { font-size: 12px; opacity: .7; margin-top: 2px; }
+  #ai-assistant-close { background: none; border: none; color: #fff; opacity: .8; cursor: pointer; font-size: 18px; line-height: 1; }
+
+  #ai-assistant-messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    background: #fcfcfb;
+  }
+
+  .ai-msg { max-width: 82%; padding: 10px 14px; border-radius: 14px; font-size: 13.5px; line-height: 1.8; white-space: pre-wrap; }
+  .ai-msg.user { align-self: flex-end; background: var(--ai-bubble-user); color: var(--ai-bubble-user-text); border-bottom-left-radius: 4px; }
+  .ai-msg.bot { align-self: flex-start; background: var(--ai-bubble-bot); color: var(--ai-bubble-bot-text); border-bottom-right-radius: 4px; }
+  .ai-msg.typing { align-self: flex-start; background: var(--ai-bubble-bot); color: #888; font-size: 12px; }
+
+  .ai-products { display: flex; gap: 10px; overflow-x: auto; padding: 4px 2px 8px; }
+  .ai-product-card {
+    flex: 0 0 auto;
+    width: 130px;
+    border: 1px solid var(--ai-border);
+    border-radius: 12px;
+    overflow: hidden;
+    background: #fff;
+    cursor: default;
+  }
+  .ai-product-card img { width: 100%; height: 90px; object-fit: cover; display: block; background: #eee; }
+  .ai-product-card .info { padding: 8px; }
+  .ai-product-card .name { font-size: 11.5px; font-weight: 600; margin-bottom: 4px; line-height: 1.4; max-height: 2.8em; overflow: hidden; }
+  .ai-product-card .price { font-size: 11px; color: var(--ai-accent); font-weight: 700; }
+  .ai-product-card .stock { font-size: 10px; margin-top: 2px; }
+  .ai-product-card .stock.out { color: #c0392b; }
+  .ai-product-card .stock.in { color: #2f6f4f; }
+
+  #ai-assistant-inputbar { display: flex; gap: 8px; padding: 12px; border-top: 1px solid var(--ai-border); background: #fff; }
+  #ai-assistant-input {
+    flex: 1;
+    border: 1px solid var(--ai-border);
+    border-radius: 999px;
+    padding: 10px 14px;
+    font-size: 13px;
+    outline: none;
+    font-family: inherit;
+  }
+  #ai-assistant-input:focus { border-color: var(--ai-primary); }
+  #ai-assistant-send {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    border: none;
+    background: var(--ai-primary);
+    color: #fff;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+  #ai-assistant-send:disabled { opacity: .5; cursor: default; }
+  #ai-assistant-send svg { width: 16px; height: 16px; transform: scaleX(-1); }
+</style>
+</head>
+<body>
+
+<div id="ai-demo-page">
+  <h1>نمونه ویجت دستیار خرید هوشمند</h1>
+  <p>
+    این یه صفحه‌ی نمونه‌ست تا رفتار ویجت رو ببینی. روی دکمه‌ی گرد پایین سمت چپ بزن و
+    مثلاً بپرس: «یه دمپایی خونگی ارزون قیمت می‌خوام» یا «چه رنگ‌هایی موجوده؟».
+    این ویجت مستقیم به endpoint واقعی <code>/api/v1/chat</code> وصل می‌شه و از کاتالوگ
+    واقعی محصولات جواب می‌ده - چیزی از خودش نمی‌سازه.
+  </p>
+  <p>
+    برای استفاده‌ی واقعی: کل <code>&lt;div id="ai-assistant-root"&gt;</code> و بلاک
+    <code>&lt;script&gt;</code> پایین صفحه رو کپی کن توی فرانت‌اند اصلی فروشگاه (لایه‌ی
+    مشتری، نه پنل ادمین) و <code>API_BASE</code> و <code>getAuthToken()</code> رو با
+    تنظیمات همون سایت هماهنگ کن.
+  </p>
+</div>
+
+<!-- ============================================================
+     Widget markup - copy this whole block into the storefront
+     ============================================================ -->
+<div id="ai-assistant-root">
+  <button id="ai-assistant-launcher" aria-label="دستیار خرید">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
+  </button>
+
+  <div id="ai-assistant-panel">
+    <div id="ai-assistant-header">
+      <div>
+        <div class="title">دستیار خرید</div>
+        <div class="subtitle">همیشه آنلاین</div>
+      </div>
+      <button id="ai-assistant-close">✕</button>
+    </div>
+    <div id="ai-assistant-messages"></div>
+    <div id="ai-assistant-inputbar">
+      <input id="ai-assistant-input" type="text" placeholder="سوالتو بپرس..." />
+      <button id="ai-assistant-send" aria-label="ارسال">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M2 21l21-9L2 3v7l15 2-15 2v7z"/></svg>
+      </button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  // ---- configure these two for the real storefront -----------------
+  const API_BASE = "http://localhost:8000/api/v1"; // -> your FastAPI backend
+  function getAuthToken() {
+    // return the logged-in customer's bearer token here, e.g.:
+    // return localStorage.getItem("token");
+    return null;
+  }
+  // --------------------------------------------------------------------
+
+  const launcher = document.getElementById("ai-assistant-launcher");
+  const panel = document.getElementById("ai-assistant-panel");
+  const closeBtn = document.getElementById("ai-assistant-close");
+  const messagesEl = document.getElementById("ai-assistant-messages");
+  const input = document.getElementById("ai-assistant-input");
+  const sendBtn = document.getElementById("ai-assistant-send");
+
+  let history = []; // [{role, content}]
+  let sending = false;
+
+  launcher.addEventListener("click", () => {
+    panel.classList.toggle("open");
+    if (panel.classList.contains("open") && history.length === 0) {
+      addBotMessage("سلام! من دستیار خرید فروشگاهم 🙂 دنبال چی می‌گردی؟");
+    }
+  });
+  closeBtn.addEventListener("click", () => panel.classList.remove("open"));
+
+  function formatPrice(toman) {
+    if (!toman) return "";
+    return new Intl.NumberFormat("fa-IR").format(toman) + " تومان";
+  }
+
+  function addUserMessage(text) {
+    const el = document.createElement("div");
+    el.className = "ai-msg user";
+    el.textContent = text;
+    messagesEl.appendChild(el);
+    scrollToBottom();
+  }
+
+  function addBotMessage(text, products) {
+    const el = document.createElement("div");
+    el.className = "ai-msg bot";
+    el.textContent = text;
+    messagesEl.appendChild(el);
+
+    if (products && products.length) {
+      const row = document.createElement("div");
+      row.className = "ai-products";
+      products.forEach((p) => {
+        const card = document.createElement("div");
+        card.className = "ai-product-card";
+        card.innerHTML = `
+          <img src="${p.image ? API_BASE.replace(/\/api\/v1$/, '') + p.image : ''}" alt="${p.name}" onerror="this.style.opacity=0">
+          <div class="info">
+            <div class="name">${p.name}</div>
+            <div class="price">${formatPrice(p.min_price)}</div>
+            <div class="stock ${p.in_stock ? 'in' : 'out'}">${p.in_stock ? 'موجود' : 'ناموجود'}</div>
+          </div>`;
+        row.appendChild(card);
+      });
+      messagesEl.appendChild(row);
+    }
+    scrollToBottom();
+  }
+
+  function addTypingIndicator() {
+    const el = document.createElement("div");
+    el.className = "ai-msg typing";
+    el.id = "ai-typing-indicator";
+    el.textContent = "در حال تایپ...";
+    messagesEl.appendChild(el);
+    scrollToBottom();
+  }
+  function removeTypingIndicator() {
+    const el = document.getElementById("ai-typing-indicator");
+    if (el) el.remove();
+  }
+
+  function scrollToBottom() {
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  async function send() {
+    const text = input.value.trim();
+    if (!text || sending) return;
+
+    input.value = "";
+    addUserMessage(text);
+    history.push({ role: "user", content: text });
+
+    sending = true;
+    sendBtn.disabled = true;
+    addTypingIndicator();
+
+    try {
+      const token = getAuthToken();
+      const res = await fetch(`${API_BASE}/chat`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ messages: history }),
+      });
+      const json = await res.json();
+      removeTypingIndicator();
+
+      const data = json.data || {};
+      addBotMessage(data.reply || "متاسفانه مشکلی پیش اومد.", data.products);
+      history.push({ role: "assistant", content: data.reply || "" });
+
+      if (data.cart_updated) {
+        // hook this up to the real storefront's cart badge/refresh logic
+        window.dispatchEvent(new CustomEvent("cart:updated"));
+      }
+    } catch (err) {
+      removeTypingIndicator();
+      addBotMessage("اتصال به دستیار برقرار نشد. لطفاً دوباره امتحان کن.");
+    } finally {
+      sending = false;
+      sendBtn.disabled = false;
+    }
+  }
+
+  sendBtn.addEventListener("click", send);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") send();
+  });
+})();
+</script>
+
+</body>
+</html>
