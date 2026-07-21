@@ -1,0 +1,33 @@
+# For local testing only - Runflare (or any other PaaS) provisions the
+# database and each service separately via its own dashboard/CLI, it
+# doesn't consume this file. This just lets you sanity-check the Docker
+# images work together before deploying them individually.
+version: "3.8"
+
+services:
+  db:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: shop
+    ports:
+      - "3306:3306"
+    volumes:
+      - db_data:/var/lib/mysql
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: mysql://root:root@db:3306/shop
+      TOKEN_SECRET: local-dev-secret
+      PAYMENT_CALLBACK_URL: http://localhost:3000/payment/verify
+    depends_on:
+      - db
+    volumes:
+      - api_storage:/app/storage
+
+volumes:
+  db_data:
+  api_storage:

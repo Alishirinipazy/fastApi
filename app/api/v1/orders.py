@@ -83,7 +83,7 @@ def _serialize_order(order: Order, with_items: bool = False) -> dict:
         "id": order.id,
         "user_id": order.user_id,
         "user_name": order.user.name if order.user else None,
-        "user_cellphone": order.user.cellphone if order.user else None,
+        "user_phone": order.user.cellphone if order.user else None,
         "address_title": address.address if address else None,
         "payment_status": order.payment_status,
         "order_status": order.order_status,
