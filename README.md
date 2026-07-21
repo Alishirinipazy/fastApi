@@ -192,13 +192,17 @@ docker run -p 8000:8000 --env-file .env slipper-api
 
 Runflare specifically: it's a Docker/Kubernetes-based PaaS where each
 project holds separate "services" (this backend, the storefront, the admin
-panel) plus a "database" service you provision alongside them - deploy via
-their CLI (`pip install runflare`, then `runflare deploy` from this
-directory) or by pointing a service at this Dockerfile, whichever their
-dashboard offers for your project. Their docs weren't reachable to confirm
-the exact env-var name Runflare injects for the container port - if `$PORT`
-isn't it, override the port Runflare expects to via its dashboard rather
-than editing the Dockerfile, everything here already reads `$PORT`.
+panel) plus a "database" service you provision alongside them. **In
+practice it turned out Runflare auto-detects a Python/FastAPI app and runs
+its own `gunicorn main:app -k uvicorn.workers.UvicornWorker` from the
+project root, ignoring this repo's `Dockerfile`/`docker-entrypoint.sh`
+entirely** - it assumes a top-level `main.py` with an `app` variable, not
+`app/main.py`. Without it, every worker crashes on boot with
+`ModuleNotFoundError: No module named 'main'` and the service 502s forever.
+The fix is the root-level `main.py` in this repo - it just does
+`from app.main import app`, so both conventions resolve to the same app
+without maintaining two copies. If another platform behaves differently
+(actually uses the Dockerfile), nothing here needs to change either way.
 
 **Set these in Runflare's service environment variables panel** (or
 `--env-file .env` locally) - none of this is baked into the image:
