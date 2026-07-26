@@ -43,4 +43,4 @@ def image_url(filename: str | None, subdir: str) -> str | None:
     """Mirrors asset('storage/images/products/' . $filename)."""
     if not filename:
         return None
-    return f"/storage/images/{subdir}/{filename}"
+    return f"https://api.slipperpaz.ir/storage/images/{subdir}/{filename}"
