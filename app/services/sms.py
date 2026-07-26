@@ -40,3 +40,4 @@ class SmsService:
         )
 
         response.raise_for_status()
+sms_service = SmsService()
