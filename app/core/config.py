@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     TOKEN_EXPIRE_MINUTES: int = 0  # 0 = never expires
 
     GHASEDAK_API_KEY: str = ""
-
+    SMS_IR_API_KEY: str = ""
     ZIBAL_MERCHANT: str = "zibal"  # "zibal" is Zibal's official test merchant id - swap for the real one in production
     PAYMENT_CALLBACK_URL: str = "http://localhost:3000/payment/verify"
 
