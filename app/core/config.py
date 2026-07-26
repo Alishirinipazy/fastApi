@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     GAPGPT_API_KEY: str = ""
     GAPGPT_MODEL: str = "gpt-4o-mini"
 
-    CORS_ORIGINS: str = "http://localhost:3000"
+    CORS_ORIGINS: str = "https://slipperpaz.ir"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
