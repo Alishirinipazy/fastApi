@@ -56,44 +56,26 @@ def list_categories(db: Session = Depends(get_db)):
 @admin_router.get("/categories")
 def admin_index(
     request: Request,
-    page: Optional[str] = Query(None),   # اول به صورت رشته بگیر
+    page: Optional[str] = Query(None),
     db: Session = Depends(get_db),
     _: User = Depends(get_current_admin),
 ):
-    # تبدیل امن به عدد
-    page_num = None
+    # تبدیل امن page
+    page_num = 1
     if page and page.lower() not in ("undefined", "null", ""):
         try:
-            page_num = int(page)
-            if page_num < 1:
-                page_num = None
+            page_num = max(1, int(page))
         except ValueError:
-            page_num = None
+            page_num = 1
 
-    # حالا از page_num استفاده کن
-    query = db.query(Category)  # مدل خودت رو بذار
+    query = db.query(Category).order_by(Category.created_at.desc())
+    items, links, meta = paginate(query, request, page_num, per_page=10)
 
-    if page_num is not None:
-        page_size = 10
-        offset = (page_num - 1) * page_size
-        items = query.offset(offset).limit(page_size).all()
-        total = query.count()
-        
-        return {
-            "items": items,
-            "page": page_num,
-            "page_size": page_size,
-            "total": total,
-        }
-    else:
-        # صفحه نفرستاده یا undefined بوده → همه داده‌ها
-        items = query.all()
-        return {
-            "items": items,
-            "page": None,
-            "page_size": None,
-            "total": len(items),
-        }
+    return success_response({
+        "categories": [_serialize(c) for c in items],
+        "links": links,
+        "meta": meta,
+    })
 
 @admin_router.get("/categories-list")
 def admin_list(db: Session = Depends(get_db), _: User = Depends(get_current_admin)):
