@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, Form, Request, UploadFile, File,Query
 from sqlalchemy.orm import Session, joinedload
+from typing import Optional
 
 from app.api.deps import get_current_admin
 from app.db.session import get_db
@@ -52,18 +53,47 @@ def list_categories(db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 # Admin panel
 # ---------------------------------------------------------------------------
-
 @admin_router.get("/categories")
 def admin_index(
     request: Request,
-    page: int = Query(1, ge=1),
+    page: Optional[str] = Query(None),   # اول به صورت رشته بگیر
     db: Session = Depends(get_db),
     _: User = Depends(get_current_admin),
 ):
-    query = db.query(Category).order_by(Category.created_at.desc())
-    items, links, meta = paginate(query, request, page, per_page=10)
-    return success_response({"categories": [_serialize(c) for c in items], "links": links, "meta": meta})
+    # تبدیل امن به عدد
+    page_num = None
+    if page and page.lower() not in ("undefined", "null", ""):
+        try:
+            page_num = int(page)
+            if page_num < 1:
+                page_num = None
+        except ValueError:
+            page_num = None
 
+    # حالا از page_num استفاده کن
+    query = db.query(Category)  # مدل خودت رو بذار
+
+    if page_num is not None:
+        page_size = 10
+        offset = (page_num - 1) * page_size
+        items = query.offset(offset).limit(page_size).all()
+        total = query.count()
+        
+        return {
+            "items": items,
+            "page": page_num,
+            "page_size": page_size,
+            "total": total,
+        }
+    else:
+        # صفحه نفرستاده یا undefined بوده → همه داده‌ها
+        items = query.all()
+        return {
+            "items": items,
+            "page": None,
+            "page_size": None,
+            "total": len(items),
+        }
 
 @admin_router.get("/categories-list")
 def admin_list(db: Session = Depends(get_db), _: User = Depends(get_current_admin)):
