@@ -13,7 +13,7 @@ class SmsService:
         self,
         mobile: str,
         code: str,
-        template_id: int = 100000,  
+        template_id: int = 147240,  
     ) -> None:
         if not self.api_key:
             print(f"[dev] would send OTP {code} to {mobile} via SMS.ir")
