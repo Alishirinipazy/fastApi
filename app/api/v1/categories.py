@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Form, Request, UploadFile, File
+from fastapi import APIRouter, Depends, Form, Request, UploadFile, File,Query
 from sqlalchemy.orm import Session, joinedload
 
 from app.api.deps import get_current_admin
@@ -56,7 +56,7 @@ def list_categories(db: Session = Depends(get_db)):
 @admin_router.get("/categories")
 def admin_index(
     request: Request,
-    page: int = 1,
+    page: int = Query(1, ge=1),
     db: Session = Depends(get_db),
     _: User = Depends(get_current_admin),
 ):
