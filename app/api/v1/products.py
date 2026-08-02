@@ -29,6 +29,25 @@ def _with_variants(query):
     )
 
 
+def _category_and_descendant_ids(db: Session, category_id: int) -> list[int]:
+    """
+    Categories are parent/child (e.g. "کفش" -> "کفش مردانه" -> "کفش اسپرت").
+    Filtering by a parent category should include products assigned to any
+    of its descendants too, not just products assigned to that exact id.
+    """
+    all_ids = [category_id]
+    frontier = [category_id]
+    while frontier:
+        children = (
+            db.query(Category.id)
+            .filter(Category.parent_id.in_(frontier))
+            .all()
+        )
+        frontier = [c.id for c in children if c.id not in all_ids]
+        all_ids.extend(frontier)
+    return all_ids
+
+
 def _total_quantity(product: Product) -> int:
     return sum(size.quantity for color in product.colors for size in color.sizes)
 
@@ -133,7 +152,7 @@ def menu(
     query = _with_variants(db.query(Product))
 
     if category is not None:
-        query = query.filter(Product.category_id == category)
+        query = query.filter(Product.category_id.in_(_category_and_descendant_ids(db, category)))
 
     if search and search.strip():
         query = query.filter(Product.name.ilike(f"%{search.strip()}%"))

@@ -11,4 +11,5 @@ python-multipart==0.0.9
 mysqlclient==2.2.4
 httpx==0.27.2
 jdatetime==5.0.0
+Pillow==10.4.0
 
