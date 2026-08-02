@@ -5,9 +5,20 @@ from pathlib import Path
 from fastapi import UploadFile
 from PIL import Image, ImageOps
 
+from app.core.config import settings
+
 # Mirrors Laravel's storage/app/public/images/{products,categories} + the
 # public/storage symlink. Served at /storage via StaticFiles in app/main.py.
-STORAGE_ROOT = Path(__file__).resolve().parent.parent.parent / "storage"
+#
+# STORAGE_ROOT is configurable (see app/core/config.py) because it MUST
+# match wherever the persistent volume is actually mounted in production -
+# on Runflare that's /storage, not the project-relative default below which
+# only lives inside the container's ephemeral filesystem.
+STORAGE_ROOT = (
+    Path(settings.STORAGE_ROOT)
+    if settings.STORAGE_ROOT
+    else Path(__file__).resolve().parent.parent.parent / "storage"
+)
 
 # Any image wider/taller than this gets downscaled (keeps aspect ratio).
 # 2000px is comfortably larger than any product/category display size on
@@ -49,22 +60,24 @@ def save_upload(upload: UploadFile, subdir: str) -> str:
 
     Image uploads (jpg/png/etc.) are automatically compressed and re-encoded
     as WebP. Non-image uploads (e.g. story videos) are stored unchanged.
+
+    Whether a file "is an image" is decided by actually trying to decode it
+    with Pillow rather than trusting the client-supplied content_type header -
+    that header isn't reliably preserved by every upstream proxy (e.g. when
+    a request is relayed through a Node FormData/Blob without an explicit
+    mime type), so it can't be trusted as the sole signal.
     """
     target_dir = STORAGE_ROOT / "images" / subdir
     target_dir.mkdir(parents=True, exist_ok=True)
 
     raw = upload.file.read()
-    is_image = (upload.content_type or "").startswith("image/")
 
-    if is_image:
-        try:
-            raw = _convert_to_webp(raw)
-            ext = "webp"
-        except Exception:
-            # Corrupt/unsupported image data - fall back to storing the
-            # original bytes untouched rather than failing the request.
-            ext = (upload.filename or "").rsplit(".", 1)[-1].lower() if "." in (upload.filename or "") else "bin"
-    else:
+    try:
+        raw = _convert_to_webp(raw)
+        ext = "webp"
+    except Exception:
+        # Not a decodable image (e.g. a story video) - store the original
+        # bytes untouched.
         ext = (upload.filename or "").rsplit(".", 1)[-1].lower() if "." in (upload.filename or "") else "bin"
 
     filename = _unique_filename(ext)
