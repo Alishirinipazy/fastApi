@@ -35,6 +35,14 @@ class Settings(BaseSettings):
 
     CORS_ORIGINS: str = "https://slipperpaz.ir"
 
+    # Absolute path where uploaded images/files are written. Leave empty to
+    # default to <project_root>/storage (fine for local dev). In production
+    # this MUST match the mount path of the persistent volume attached to
+    # the service (currently mounted at /storage on Runflare), otherwise
+    # uploads land in the container's ephemeral filesystem and vanish on
+    # every redeploy.
+    STORAGE_ROOT: str = ""
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property
