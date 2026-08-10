@@ -41,9 +41,7 @@ class Product(Base, TimestampMixin, SoftDeleteMixin):
     )
     order_items: Mapped[list["OrderItems"]] = relationship(
         back_populates="product"
-        passive_deletes=True
-        # معمولاً برای order_items cascade نمی‌گذاریم (چون سفارش نباید پاک شود)
-    )
+)
 
 class ProductImage(Base, TimestampMixin, SoftDeleteMixin):
     __tablename__ = "product_images"
