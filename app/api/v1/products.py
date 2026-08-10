@@ -48,12 +48,25 @@ def _category_and_descendant_ids(db: Session, category_id: int) -> list[int]:
     return all_ids
 
 
+def _active_products(db: Session):
+    """Base query for products that haven't been soft-deleted."""
+    return db.query(Product).filter(Product.deleted_at.is_(None))
+
+
 def _total_quantity(product: Product) -> int:
-    return sum(size.quantity for color in product.colors for size in color.sizes)
+    return sum(
+        size.quantity
+        for color in product.colors if color.deleted_at is None
+        for size in color.sizes if size.deleted_at is None
+    )
 
 
 def _min_price(product: Product) -> int:
-    prices = [size.price for color in product.colors for size in color.sizes]
+    prices = [
+        size.price
+        for color in product.colors if color.deleted_at is None
+        for size in color.sizes if size.deleted_at is None
+    ]
     return min(prices) if prices else 0
 
 
@@ -73,7 +86,7 @@ def _serialize_color(color: ProductColor) -> dict:
         "name": color.name,
         "color_code": color.color_code,
         "image": image_url(color.image, IMAGE_SUBDIR),
-        "sizes": [_serialize_size(s) for s in color.sizes],
+        "sizes": [_serialize_size(s) for s in color.sizes if s.deleted_at is None],
     }
 
 
@@ -99,7 +112,7 @@ def _serialize_product(product: Product) -> dict:
             {"id": img.id, "product_id": img.product_id, "primary_image": image_url(img.image, IMAGE_SUBDIR)}
             for img in product.images
         ],
-        "colors": [_serialize_color(c) for c in product.colors],
+        "colors": [_serialize_color(c) for c in product.colors if c.deleted_at is None],
     }
 
 
@@ -107,9 +120,29 @@ def _serialize_product(product: Product) -> dict:
 # Public
 # ---------------------------------------------------------------------------
 
+@router.get("/sitemap-data")
+def sitemap_data(db: Session = Depends(get_db)):
+    """
+    Minimal, unpaginated listing of every published product's slug + all
+    categories - used by the frontend to build sitemap.xml. Kept separate
+    from /products (which is paginated 6-at-a-time) since a sitemap needs
+    every URL in one shot.
+    """
+    products = (
+        db.query(Product.slug, Product.updated_at)
+        .filter(Product.status == 1, Product.deleted_at.is_(None))
+        .all()
+    )
+    categories = db.query(Category.id, Category.name).all()
+    return success_response({
+        "products": [{"slug": p.slug, "updated_at": p.updated_at.isoformat()} for p in products],
+        "categories": [{"id": c.id, "name": c.name} for c in categories],
+    })
+
+
 @router.get("/products")
 def list_products(request: Request, page: int = 1, db: Session = Depends(get_db)):
-    query = _with_variants(db.query(Product)).order_by(Product.created_at.desc())
+    query = _with_variants(_active_products(db)).order_by(Product.created_at.desc())
     items, links, meta = paginate(query, request, page, per_page=6)
     return success_response({"products": [_serialize_product(p) for p in items], "links": links, "meta": meta})
 
@@ -121,7 +154,7 @@ def products_tabs(db: Session = Depends(get_db)):
     tab_panel = []
     for category in categories:
         products = (
-            _with_variants(db.query(Product))
+            _with_variants(_active_products(db))
             .filter(Product.category_id == category.id)
             .limit(9)
             .all()
@@ -132,7 +165,7 @@ def products_tabs(db: Session = Depends(get_db)):
 
 @router.get("/random-products")
 def random_products(count: int, db: Session = Depends(get_db)):
-    products = _with_variants(db.query(Product)).order_by(func.rand()).limit(count).all()
+    products = _with_variants(_active_products(db)).order_by(func.rand()).limit(count).all()
     return success_response([_serialize_product(p) for p in products])
 
 
@@ -149,7 +182,7 @@ def menu(
     size: str | None = None,
     db: Session = Depends(get_db),
 ):
-    query = _with_variants(db.query(Product))
+    query = _with_variants(_active_products(db))
 
     if category is not None:
         query = query.filter(Product.category_id.in_(_category_and_descendant_ids(db, category)))
@@ -243,7 +276,7 @@ def filter_options(db: Session = Depends(get_db)):
 
 @router.get("/products/{slug}")
 def show_product(slug: str, db: Session = Depends(get_db)):
-    product = _with_variants(db.query(Product)).filter(Product.slug == slug).first()
+    product = _with_variants(_active_products(db)).filter(Product.slug == slug).first()
     if product is None:
         return error_response("محصول پیدا نشد", 404)
     return success_response(_serialize_product(product))
@@ -255,12 +288,7 @@ def show_product(slug: str, db: Session = Depends(get_db)):
 
 @admin_router.get("/products")
 def admin_index(request: Request, page: int = 1, db: Session = Depends(get_db), _: User = Depends(get_current_admin)):
-    query = _with_variants(db.query(Product)).order_by(Product.created_at.desc())
-    items, links, meta = paginate(query, request, page, per_page=6)
-    return success_response({"products": [_serialize_product(p) for p in items], "links": links, "meta": meta})
-
-
-@admin_router.post("/products")
+    query = _with_variants(_active_products(db)).order_by(Product.created_at.desc())
 def admin_store(
     name: str = Form(...),
     category_id: int = Form(...),
@@ -393,12 +421,13 @@ def admin_destroy(product_id: int, db: Session = Depends(get_db), _: User = Depe
     product = db.query(Product).filter(Product.id == product_id).first()
     if product is None:
         return error_response("محصول پیدا نشد", 404)
-
-    # اگر این محصول در سفارش‌ها استفاده شده، حذف نکن
-    if product.order_items:
-        return error_response("این محصول در سفارش‌ها استفاده شده و قابل حذف نیست", 400)
-
-    db.delete(product)
+    # Soft delete (not db.delete()): products already have order_items
+    # pointing at them once they've ever been ordered, and product_id there
+    # is NOT NULL - a hard delete makes SQLAlchemy try to null that column
+    # out before removing the row, which fails with an IntegrityError (500).
+    # Soft-deleting also preserves order history, matching SoftDeleteMixin's
+    # intent everywhere else in this codebase.
+    product.deleted_at = datetime.utcnow()
     db.commit()
     return success_response({"data": ["deleted"]})
 
@@ -447,7 +476,9 @@ def admin_delete_color(
     )
     if color is None:
         return error_response("رنگ پیدا نشد", 404)
-    db.delete(color)
+    # Soft delete for the same reason as admin_destroy above: this color's
+    # sizes reference it with a NOT NULL product_color_id.
+    color.deleted_at = datetime.utcnow()
     db.commit()
     return success_response({"data": ["deleted"]})
 
@@ -529,6 +560,6 @@ def admin_delete_size(
     )
     if size is None:
         return error_response("سایز پیدا نشد", 404)
-    db.delete(size)
+    size.deleted_at = datetime.utcnow()
     db.commit()
     return success_response({"data": ["deleted"]})
