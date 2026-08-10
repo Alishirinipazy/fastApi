@@ -20,7 +20,7 @@ def _serialize(coupon: Coupon) -> dict:
         "id": coupon.id,
         "code": coupon.code,
         "percentage": coupon.percentage,
-        "expired_at": coupon.expired_at,
+        "expired_at": coupon.expired_at.isoformat() if coupon.expired_at else None,
         "expired_at_jalali": format_jalali(coupon.expired_at),
         "created_at": format_jalali(coupon.created_at),
     }

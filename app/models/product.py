@@ -6,7 +6,6 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.session import Base
 from app.models.mixins import TimestampMixin, SoftDeleteMixin
 
-
 class Product(Base, TimestampMixin, SoftDeleteMixin):
     __tablename__ = "products"
 
@@ -30,28 +29,21 @@ class Product(Base, TimestampMixin, SoftDeleteMixin):
     date_on_sale_to: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     category: Mapped["Category"] = relationship(back_populates="products")
-    images: Mapped[list["ProductImage"]] = relationship(back_populates="product")
-    colors: Mapped[list["ProductColor"]] = relationship(back_populates="product")
-    order_items: Mapped[list["OrderItems"]] = relationship(back_populates="product")
-
-    _STATUS_LABELS = {0: "غیر فعال", 1: "فعال"}
-
-    @property
-    def status_label(self) -> str:
-        """Mirrors Product::getStatusAttribute()."""
-        return self._STATUS_LABELS.get(self.status, str(self.status))
-
-    @property
-    def total_quantity(self) -> int:
-        """Mirrors Product::getTotalQuantityAttribute(). Requires colors.sizes loaded."""
-        return sum(size.quantity for color in self.colors for size in color.sizes)
-
-    @property
-    def min_price(self) -> int:
-        """Mirrors Product::getMinPriceAttribute(). Requires colors.sizes loaded."""
-        prices = [size.price for color in self.colors for size in color.sizes]
-        return min(prices) if prices else 0
-
+    
+    # ───── تغییرات مهم اینجا ─────
+    images: Mapped[list["ProductImage"]] = relationship(
+        back_populates="product",
+        cascade="all, delete-orphan"
+    )
+    colors: Mapped[list["ProductColor"]] = relationship(
+        back_populates="product",
+        cascade="all, delete-orphan"
+    )
+    order_items: Mapped[list["OrderItems"]] = relationship(
+        back_populates="product"
+        passive_deletes=True
+        # معمولاً برای order_items cascade نمی‌گذاریم (چون سفارش نباید پاک شود)
+    )
 
 class ProductImage(Base, TimestampMixin, SoftDeleteMixin):
     __tablename__ = "product_images"
@@ -68,13 +60,16 @@ class ProductColor(Base, TimestampMixin, SoftDeleteMixin):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id", ondelete="CASCADE"))
-    name: Mapped[str] = mapped_column(String(255))  # e.g. black, blue
-    color_code: Mapped[str] = mapped_column(String(32))  # e.g. #000000
+    name: Mapped[str] = mapped_column(String(255))
+    color_code: Mapped[str] = mapped_column(String(32))
     image: Mapped[str] = mapped_column(String(255))
 
     product: Mapped["Product"] = relationship(back_populates="colors")
-    sizes: Mapped[list["ProductSize"]] = relationship(back_populates="color")
-
+    
+    sizes: Mapped[list["ProductSize"]] = relationship(
+        back_populates="color",
+        cascade="all, delete-orphan"          # اضافه کنید
+    )
 
 class ProductSize(Base, TimestampMixin, SoftDeleteMixin):
     __tablename__ = "product_sizes"

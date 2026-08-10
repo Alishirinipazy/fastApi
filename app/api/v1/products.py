@@ -393,6 +393,11 @@ def admin_destroy(product_id: int, db: Session = Depends(get_db), _: User = Depe
     product = db.query(Product).filter(Product.id == product_id).first()
     if product is None:
         return error_response("محصول پیدا نشد", 404)
+
+    # اگر این محصول در سفارش‌ها استفاده شده، حذف نکن
+    if product.order_items:
+        return error_response("این محصول در سفارش‌ها استفاده شده و قابل حذف نیست", 400)
+
     db.delete(product)
     db.commit()
     return success_response({"data": ["deleted"]})
