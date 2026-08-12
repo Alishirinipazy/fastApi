@@ -53,21 +53,54 @@ def _active_products(db: Session):
     return db.query(Product).filter(Product.deleted_at.is_(None))
 
 
+def _active_colors(product: Product):
+    return [c for c in product.colors if c.deleted_at is None]
+
+
+def _has_variants(product: Product) -> bool:
+    return any(len(c.sizes) for c in _active_colors(product) if any(s.deleted_at is None for s in c.sizes))
+
+
 def _total_quantity(product: Product) -> int:
+    """Simple products (no colors/sizes - e.g. a bag or socks) keep their
+    stock directly on product.quantity; products with variants sum it from
+    their sizes instead."""
+    if not _has_variants(product):
+        return product.quantity or 0
     return sum(
         size.quantity
-        for color in product.colors if color.deleted_at is None
+        for color in _active_colors(product)
         for size in color.sizes if size.deleted_at is None
     )
 
 
 def _min_price(product: Product) -> int:
+    """Same fallback as _total_quantity: simple products price directly off
+    product.price, variant products off their cheapest size."""
+    if not _has_variants(product):
+        return product.price or 0
     prices = [
         size.price
-        for color in product.colors if color.deleted_at is None
+        for color in _active_colors(product)
         for size in color.sizes if size.deleted_at is None
     ]
     return min(prices) if prices else 0
+
+
+def _is_on_sale(product: Product, now: datetime | None = None) -> bool:
+    """Whether the product's discount is currently active - requires a
+    sale_price to be set AND (if given) the current time to fall within
+    date_on_sale_from/date_on_sale_to. Once date_on_sale_to passes, this
+    flips back to False on its own (no cron/cleanup job needed) since it's
+    computed live on every request."""
+    if not product.sale_price or product.sale_price <= 0:
+        return False
+    now = now or datetime.utcnow()
+    if product.date_on_sale_from and now < product.date_on_sale_from:
+        return False
+    if product.date_on_sale_to and now > product.date_on_sale_to:
+        return False
+    return True
 
 
 def _serialize_size(size: ProductSize) -> dict:
@@ -91,6 +124,8 @@ def _serialize_color(color: ProductColor) -> dict:
 
 
 def _serialize_product(product: Product) -> dict:
+    regular_price = _min_price(product)
+    on_sale = _is_on_sale(product)
     return {
         "id": product.id,
         "name": product.name,
@@ -101,13 +136,23 @@ def _serialize_product(product: Product) -> dict:
         "status_value": product.status,
         "status": STATUS_LABELS.get(product.status, product.status),
         "description": product.description,
+        "has_variants": _has_variants(product),
         "total_quantity": _total_quantity(product),
-        "min_price": _min_price(product),
-        "price": _min_price(product),  # kept for backwards compatibility, as in the Laravel resource
+        "min_price": regular_price,
+        "price": on_sale and product.sale_price or regular_price,  # kept for backwards compatibility, as in the Laravel resource - now sale-aware
         "quantity": _total_quantity(product),
+        # Discount: on_sale tells the frontend whether to show the struck-through
+        # regular_price + final_price, and whether to run the countdown timer off
+        # date_on_sale_to. Once "now" passes date_on_sale_to, on_sale flips back
+        # to false automatically and final_price reverts to regular_price - no
+        # separate cleanup step needed.
+        "on_sale": on_sale,
+        "regular_price": regular_price,
+        "final_price": product.sale_price if on_sale else regular_price,
+        "discount_percent": round((1 - product.sale_price / regular_price) * 100) if on_sale and regular_price else 0,
         "sale_price": product.sale_price or 0,
-        "date_on_sale_from": product.date_on_sale_from,
-        "date_on_sale_to": product.date_on_sale_to,
+        "date_on_sale_from": product.date_on_sale_from.isoformat() if product.date_on_sale_from else None,
+        "date_on_sale_to": product.date_on_sale_to.isoformat() if product.date_on_sale_to else None,
         "images": [
             {"id": img.id, "product_id": img.product_id, "primary_image": image_url(img.image, IMAGE_SUBDIR)}
             for img in product.images
@@ -289,11 +334,23 @@ def show_product(slug: str, db: Session = Depends(get_db)):
 @admin_router.get("/products")
 def admin_index(request: Request, page: int = 1, db: Session = Depends(get_db), _: User = Depends(get_current_admin)):
     query = _with_variants(_active_products(db)).order_by(Product.created_at.desc())
+    items, links, meta = paginate(query, request, page, per_page=6)
+    return success_response({"products": [_serialize_product(p) for p in items], "links": links, "meta": meta})
+
+
+@admin_router.post("/products")
 def admin_store(
     name: str = Form(...),
     category_id: int = Form(...),
     description: str = Form(...),
     status: int = Form(1),
+    # Only used for simple products (no colors/sizes) - price/quantity for a
+    # variant product come from its sizes instead, so these can stay 0/None.
+    price: int | None = Form(None),
+    quantity: int | None = Form(None),
+    sale_price: int | None = Form(None),
+    date_on_sale_from: str | None = Form(None),
+    date_on_sale_to: str | None = Form(None),
     primary_image: UploadFile = File(...),
     images: list[UploadFile] | None = File(None),
     # JSON string: [{"name": "...", "color_code": "#000", "sizes": [{"size":"40","price":100,"quantity":5}]}]
@@ -313,6 +370,11 @@ def admin_store(
         primary_image_blur_data_url="",
         description=description,
         status=status,
+        price=price or 0,
+        quantity=quantity or 0,
+        sale_price=sale_price or 0,
+        date_on_sale_from=datetime.fromisoformat(date_on_sale_from) if date_on_sale_from else None,
+        date_on_sale_to=datetime.fromisoformat(date_on_sale_to) if date_on_sale_to else None,
     )
     db.add(product)
     db.flush()  # get product.id before adding children
@@ -399,10 +461,10 @@ def admin_update(
         product.quantity = quantity
     if sale_price is not None:
         product.sale_price = sale_price
-    if date_on_sale_from:
-        product.date_on_sale_from = datetime.fromisoformat(date_on_sale_from)
-    if date_on_sale_to:
-        product.date_on_sale_to = datetime.fromisoformat(date_on_sale_to)
+    if date_on_sale_from is not None:
+        product.date_on_sale_from = datetime.fromisoformat(date_on_sale_from) if date_on_sale_from else None
+    if date_on_sale_to is not None:
+        product.date_on_sale_to = datetime.fromisoformat(date_on_sale_to) if date_on_sale_to else None
 
     if images:
         for old_image in list(product.images):
