@@ -1,627 +1,176 @@
-import json
-from datetime import datetime
-
-from fastapi import APIRouter, Depends, Request, Form, UploadFile, File
-from sqlalchemy import func
+from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session, joinedload
 
-from app.api.deps import get_current_admin
+from app.api.deps import get_current_user
+from app.api.v1.products import _is_on_sale
 from app.db.session import get_db
-from app.models import Product, ProductImage, ProductColor, ProductSize, Category, User, Order, OrderItems
-from app.schemas.product import ProductSizeIn
-from app.services.slug import make_unique_product_slug
-from app.services.storage import save_upload, image_url
-from app.utils.pagination import paginate
+from app.models import Cart, CartItem, Product, ProductSize, User
+from app.schemas.cart import CartItemIn, CartItemUpdate
+from app.services.storage import image_url
 from app.utils.response import success_response, error_response
 
-router = APIRouter(tags=["products"])
-admin_router = APIRouter(prefix="/admin-panel", tags=["admin-products"])
+router = APIRouter(prefix="/cart", tags=["cart"])
 
-IMAGE_SUBDIR = "products"
-
-STATUS_LABELS = {0: "غیر فعال", 1: "فعال"}
+PRODUCT_IMAGE_SUBDIR = "products"
 
 
-def _with_variants(query):
-    return query.options(
-        joinedload(Product.images),
-        joinedload(Product.colors).joinedload(ProductColor.sizes),
-    )
-
-
-def _category_and_descendant_ids(db: Session, category_id: int) -> list[int]:
-    """
-    Categories are parent/child (e.g. "کفش" -> "کفش مردانه" -> "کفش اسپرت").
-    Filtering by a parent category should include products assigned to any
-    of its descendants too, not just products assigned to that exact id.
-    """
-    all_ids = [category_id]
-    frontier = [category_id]
-    while frontier:
-        children = (
-            db.query(Category.id)
-            .filter(Category.parent_id.in_(frontier))
-            .all()
+def _get_or_create_cart(db: Session, user: User) -> Cart:
+    cart = (
+        db.query(Cart)
+        .options(
+            joinedload(Cart.items).joinedload(CartItem.product),
+            joinedload(Cart.items).joinedload(CartItem.color),
+            joinedload(Cart.items).joinedload(CartItem.size),
         )
-        frontier = [c.id for c in children if c.id not in all_ids]
-        all_ids.extend(frontier)
-    return all_ids
-
-
-def _active_products(db: Session):
-    """Base query for products that haven't been soft-deleted."""
-    return db.query(Product).filter(Product.deleted_at.is_(None))
-
-
-def _active_colors(product: Product):
-    return [c for c in product.colors if c.deleted_at is None]
-
-
-def _has_variants(product: Product) -> bool:
-    return any(len(c.sizes) for c in _active_colors(product) if any(s.deleted_at is None for s in c.sizes))
-
-
-def _total_quantity(product: Product) -> int:
-    """Simple products (no colors/sizes - e.g. a bag or socks) keep their
-    stock directly on product.quantity; products with variants sum it from
-    their sizes instead."""
-    if not _has_variants(product):
-        return product.quantity or 0
-    return sum(
-        size.quantity
-        for color in _active_colors(product)
-        for size in color.sizes if size.deleted_at is None
+        .filter(Cart.user_id == user.id)
+        .first()
     )
+    if cart is None:
+        cart = Cart(user_id=user.id)
+        db.add(cart)
+        db.commit()
+        db.refresh(cart)
+    return cart
 
 
-def _min_price(product: Product) -> int:
-    """Same fallback as _total_quantity: simple products price directly off
-    product.price, variant products off their cheapest size."""
-    if not _has_variants(product):
-        return product.price or 0
-    prices = [
-        size.price
-        for color in _active_colors(product)
-        for size in color.sizes if size.deleted_at is None
-    ]
-    return min(prices) if prices else 0
+def _unit_price(item: CartItem) -> int:
+    base = item.size.price if item.size is not None else (item.product.price or 0)
+    return item.product.sale_price if _is_on_sale(item.product) else base
 
 
-def _is_on_sale(product: Product, now: datetime | None = None) -> bool:
-    """Whether the product's discount is currently active - requires a
-    sale_price to be set AND (if given) the current time to fall within
-    date_on_sale_from/date_on_sale_to. Once date_on_sale_to passes, this
-    flips back to False on its own (no cron/cleanup job needed) since it's
-    computed live on every request."""
-    if not product.sale_price or product.sale_price <= 0:
-        return False
-    now = now or datetime.utcnow()
-    if product.date_on_sale_from and now < product.date_on_sale_from:
-        return False
-    if product.date_on_sale_to and now > product.date_on_sale_to:
-        return False
-    return True
-
-
-def _serialize_size(size: ProductSize) -> dict:
+def _serialize_item(item: CartItem) -> dict:
+    unit_price = _unit_price(item)
     return {
-        "id": size.id,
-        "size": size.size,
-        "price": size.price,
-        "quantity": size.quantity,
-        "available": size.quantity > 0,
+        "id": item.id,
+        "product_id": item.product_id,
+        "product_name": item.product.name,
+        "product_image": image_url(item.product.primary_image, PRODUCT_IMAGE_SUBDIR),
+        "product_color_id": item.product_color_id,
+        "color_name": item.color.name if item.color else None,
+        "color_code": item.color.color_code if item.color else None,
+        "color_image": image_url(item.color.image, PRODUCT_IMAGE_SUBDIR) if item.color else None,
+        "product_size_id": item.product_size_id,
+        "size": item.size.size if item.size else None,
+        "unit_price": unit_price,
+        "quantity": item.quantity,
+        "subtotal": unit_price * item.quantity,
+        "in_stock": (item.size.quantity if item.size else item.product.quantity) >= item.quantity,
     }
 
 
-def _serialize_color(color: ProductColor) -> dict:
+def _serialize_cart(cart: Cart) -> dict:
+    items = [_serialize_item(i) for i in cart.items]
     return {
-        "id": color.id,
-        "name": color.name,
-        "color_code": color.color_code,
-        "image": image_url(color.image, IMAGE_SUBDIR),
-        "sizes": [_serialize_size(s) for s in color.sizes if s.deleted_at is None],
+        "id": cart.id,
+        "items": items,
+        "items_count": sum(i["quantity"] for i in items),
+        "total_amount": sum(i["subtotal"] for i in items),
     }
 
 
-def _serialize_product(product: Product) -> dict:
-    regular_price = _min_price(product)
-    on_sale = _is_on_sale(product)
-    return {
-        "id": product.id,
-        "name": product.name,
-        "slug": product.slug,
-        "category": product.category.name if product.category else None,
-        "category_id": product.category_id,
-        "primary_image": image_url(product.primary_image, IMAGE_SUBDIR),
-        "status_value": product.status,
-        "status": STATUS_LABELS.get(product.status, product.status),
-        "description": product.description,
-        "has_variants": _has_variants(product),
-        "total_quantity": _total_quantity(product),
-        "min_price": regular_price,
-        "price": on_sale and product.sale_price or regular_price,  # kept for backwards compatibility, as in the Laravel resource - now sale-aware
-        "quantity": _total_quantity(product),
-        # Discount: on_sale tells the frontend whether to show the struck-through
-        # regular_price + final_price, and whether to run the countdown timer off
-        # date_on_sale_to. Once "now" passes date_on_sale_to, on_sale flips back
-        # to false automatically and final_price reverts to regular_price - no
-        # separate cleanup step needed.
-        "on_sale": on_sale,
-        "regular_price": regular_price,
-        "final_price": product.sale_price if on_sale else regular_price,
-        "discount_percent": round((1 - product.sale_price / regular_price) * 100) if on_sale and regular_price else 0,
-        "sale_price": product.sale_price or 0,
-        "date_on_sale_from": product.date_on_sale_from.isoformat() if product.date_on_sale_from else None,
-        "date_on_sale_to": product.date_on_sale_to.isoformat() if product.date_on_sale_to else None,
-        "images": [
-            {"id": img.id, "product_id": img.product_id, "primary_image": image_url(img.image, IMAGE_SUBDIR)}
-            for img in product.images
-        ],
-        "colors": [_serialize_color(c) for c in product.colors if c.deleted_at is None],
-    }
+@router.get("")
+def view_cart(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    cart = _get_or_create_cart(db, current_user)
+    return success_response(_serialize_cart(cart))
 
 
-# ---------------------------------------------------------------------------
-# Public
-# ---------------------------------------------------------------------------
-
-@router.get("/sitemap-data")
-def sitemap_data(db: Session = Depends(get_db)):
-    """
-    Minimal, unpaginated listing of every published product's slug + all
-    categories - used by the frontend to build sitemap.xml. Kept separate
-    from /products (which is paginated 6-at-a-time) since a sitemap needs
-    every URL in one shot.
-    """
-    products = (
-        db.query(Product.slug, Product.updated_at)
-        .filter(Product.status == 1, Product.deleted_at.is_(None))
-        .all()
-    )
-    categories = db.query(Category.id, Category.name).all()
-    return success_response({
-        "products": [{"slug": p.slug, "updated_at": p.updated_at.isoformat()} for p in products],
-        "categories": [{"id": c.id, "name": c.name} for c in categories],
-    })
-
-
-@router.get("/products")
-def list_products(request: Request, page: int = 1, db: Session = Depends(get_db)):
-    query = _with_variants(_active_products(db)).order_by(Product.created_at.desc())
-    items, links, meta = paginate(query, request, page, per_page=6)
-    return success_response({"products": [_serialize_product(p) for p in items], "links": links, "meta": meta})
-
-
-@router.get("/products/products-tabs")
-def products_tabs(db: Session = Depends(get_db)):
-    categories = db.query(Category).all()
-    tab_list = [c.name for c in categories]
-    tab_panel = []
-    for category in categories:
-        products = (
-            _with_variants(_active_products(db))
-            .filter(Product.category_id == category.id)
-            .limit(9)
-            .all()
-        )
-        tab_panel.append([_serialize_product(p) for p in products])
-    return success_response({"tabList": tab_list, "tabPanel": tab_panel})
-
-
-@router.get("/random-products")
-def random_products(count: int, db: Session = Depends(get_db)):
-    products = _with_variants(_active_products(db)).order_by(func.rand()).limit(count).all()
-    return success_response([_serialize_product(p) for p in products])
-
-
-@router.get("/menu")
-def menu(
-    request: Request,
-    page: int = 1,
-    category: int | None = None,
-    sort_by: str | None = None,
-    search: str | None = None,
-    price_min: int | None = None,
-    price_max: int | None = None,
-    color: str | None = None,
-    size: str | None = None,
+@router.post("/items")
+def add_item(
+    payload: CartItemIn,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    query = _with_variants(_active_products(db))
+    if payload.quantity < 1:
+        return error_response({"quantity": ["تعداد باید حداقل ۱ باشد"]}, 422)
 
-    if category is not None:
-        query = query.filter(Product.category_id.in_(_category_and_descendant_ids(db, category)))
+    if payload.product_size_id is not None:
+        size = db.query(ProductSize).filter(ProductSize.id == payload.product_size_id).first()
+        if size is None:
+            return error_response({"product_size_id": ["سایز پیدا نشد"]}, 422)
+        if size.quantity < payload.quantity:
+            return error_response({"quantity": ["موجودی کافی نیست"]}, 422)
+    else:
+        # محصول ساده (بدون سایز) - موجودی مستقیم روی خود محصوله
+        product = db.query(Product).filter(Product.id == payload.product_id).first()
+        if product is None:
+            return error_response({"product_id": ["محصول پیدا نشد"]}, 422)
+        if (product.quantity or 0) < payload.quantity:
+            return error_response({"quantity": ["موجودی کافی نیست"]}, 422)
 
-    if search and search.strip():
-        query = query.filter(Product.name.ilike(f"%{search.strip()}%"))
+    cart = _get_or_create_cart(db, current_user)
 
-    if price_min is not None or price_max is not None:
-        query = query.join(Product.colors).join(ProductColor.sizes)
-        if price_min is not None:
-            query = query.filter(ProductSize.price >= price_min)
-        if price_max is not None:
-            query = query.filter(ProductSize.price <= price_max)
-        query = query.distinct()
-
-    if color:
-        query = query.join(Product.colors).filter(ProductColor.name == color).distinct()
-
-    if size:
-        query = (
-            query.join(Product.colors)
-            .join(ProductColor.sizes)
-            .filter(ProductSize.size == size)
-            .distinct()
+    existing = (
+        db.query(CartItem)
+        .filter(
+            CartItem.cart_id == cart.id,
+            CartItem.product_id == payload.product_id,
+            CartItem.product_color_id == payload.product_color_id,
+            CartItem.product_size_id == payload.product_size_id,
         )
-
-    if sort_by == "max":
-        query = query.order_by(Product.created_at.desc())
-    elif sort_by == "min":
-        query = query.order_by(Product.created_at.asc())
-    elif sort_by == "bestseller":
-        # rank by units sold across paid orders - ties fall back to newest first
-        sold = (
-            db.query(OrderItems.product_id, func.sum(OrderItems.quantity).label("sold"))
-            .join(Order, Order.id == OrderItems.order_id)
-            .filter(Order.payment_status == 1)
-            .group_by(OrderItems.product_id)
-            .subquery()
-        )
-        query = query.outerjoin(sold, sold.c.product_id == Product.id).order_by(
-            func.coalesce(sold.c.sold, 0).desc(), Product.created_at.desc()
-        )
-
-    items, links, meta = paginate(query, request, page, per_page=6)
-    return success_response({"products": [_serialize_product(p) for p in items], "links": links, "meta": meta})
-
-
-@router.get("/filter-options")
-def filter_options(db: Session = Depends(get_db)):
-    """
-    Metadata to populate a product-listing filter sidebar: categories (with
-    how many products are in each), the overall price range, and the
-    distinct colors/sizes that actually exist across products - so the UI
-    only ever offers filters that can return results.
-
-    This wasn't actually implemented in the original Laravel app either
-    (referenced in routes/api.php, no matching CategoryController method) -
-    built fresh here to power app/api/v1/products.py's /menu filters above.
-    """
-    categories = (
-        db.query(Category.id, Category.name, Category.parent_id, func.count(Product.id).label("count"))
-        .outerjoin(Product, Product.category_id == Category.id)
-        .group_by(Category.id, Category.name, Category.parent_id)
-        .order_by(Category.name)
-        .all()
+        .first()
     )
-
-    price_row = db.query(func.min(ProductSize.price), func.max(ProductSize.price)).first()
-    price_min, price_max = price_row if price_row else (0, 0)
-
-    colors = (
-        db.query(ProductColor.name, ProductColor.color_code)
-        .distinct()
-        .order_by(ProductColor.name)
-        .all()
-    )
-
-    sizes = [row[0] for row in db.query(ProductSize.size).distinct().all()]
-    sizes.sort(key=lambda s: (len(s), s))  # numeric-ish sizes sort naturally, e.g. "9" before "10"
-
-    return success_response({
-        "categories": [
-            {"id": c.id, "name": c.name, "parent_id": c.parent_id, "product_count": c.count}
-            for c in categories
-        ],
-        "price_range": {"min": price_min or 0, "max": price_max or 0},
-        "colors": [{"name": name, "color_code": color_code} for name, color_code in colors],
-        "sizes": sizes,
-    })
-
-
-@router.get("/products/{slug}")
-def show_product(slug: str, db: Session = Depends(get_db)):
-    product = _with_variants(_active_products(db)).filter(Product.slug == slug).first()
-    if product is None:
-        return error_response("محصول پیدا نشد", 404)
-    return success_response(_serialize_product(product))
-
-
-# ---------------------------------------------------------------------------
-# Admin panel
-# ---------------------------------------------------------------------------
-
-@admin_router.get("/products")
-def admin_index(request: Request, page: int = 1, db: Session = Depends(get_db), _: User = Depends(get_current_admin)):
-    query = _with_variants(_active_products(db)).order_by(Product.created_at.desc())
-    items, links, meta = paginate(query, request, page, per_page=6)
-    return success_response({"products": [_serialize_product(p) for p in items], "links": links, "meta": meta})
-
-
-@admin_router.post("/products")
-def admin_store(
-    name: str = Form(...),
-    category_id: int = Form(...),
-    description: str = Form(...),
-    status: int = Form(1),
-    # Only used for simple products (no colors/sizes) - price/quantity for a
-    # variant product come from its sizes instead, so these can stay 0/None.
-    price: int | None = Form(None),
-    quantity: int | None = Form(None),
-    sale_price: int | None = Form(None),
-    date_on_sale_from: str | None = Form(None),
-    date_on_sale_to: str | None = Form(None),
-    primary_image: UploadFile = File(...),
-    images: list[UploadFile] | None = File(None),
-    # JSON string: [{"name": "...", "color_code": "#000", "sizes": [{"size":"40","price":100,"quantity":5}]}]
-    colors_json: str | None = Form(None),
-    # one file per entry in colors_json, same order
-    colors_images: list[UploadFile] | None = File(None),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_admin),
-):
-    primary_image_name = save_upload(primary_image, IMAGE_SUBDIR)
-
-    product = Product(
-        name=name,
-        slug=make_unique_product_slug(db, name),
-        category_id=category_id,
-        primary_image=primary_image_name,
-        primary_image_blur_data_url="",
-        description=description,
-        status=status,
-        price=price or 0,
-        quantity=quantity or 0,
-        sale_price=sale_price or 0,
-        date_on_sale_from=datetime.fromisoformat(date_on_sale_from) if date_on_sale_from else None,
-        date_on_sale_to=datetime.fromisoformat(date_on_sale_to) if date_on_sale_to else None,
-    )
-    db.add(product)
-    db.flush()  # get product.id before adding children
-
-    for image in images or []:
-        db.add(ProductImage(product_id=product.id, image=save_upload(image, IMAGE_SUBDIR)))
-
-    if colors_json:
-        colors_data = json.loads(colors_json)
-        color_images = colors_images or []
-        for index, color_data in enumerate(colors_data):
-            if index >= len(color_images):
-                return error_response(
-                    {"colors_images": [f"تصویر رنگ شماره {index} ارسال نشده"]}, 422
-                )
-            color_image_name = save_upload(color_images[index], IMAGE_SUBDIR)
-            color = ProductColor(
-                product_id=product.id,
-                name=color_data["name"],
-                color_code=color_data["color_code"],
-                image=color_image_name,
+    if existing:
+        existing.quantity += payload.quantity
+    else:
+        db.add(
+            CartItem(
+                cart_id=cart.id,
+                product_id=payload.product_id,
+                product_color_id=payload.product_color_id,
+                product_size_id=payload.product_size_id,
+                quantity=payload.quantity,
             )
-            db.add(color)
-            db.flush()
-            for size_data in color_data.get("sizes", []):
-                db.add(
-                    ProductSize(
-                        product_color_id=color.id,
-                        size=size_data["size"],
-                        price=size_data["price"],
-                        quantity=size_data["quantity"],
-                    )
-                )
-
-    db.commit()
-    db.refresh(product)
-    product = _with_variants(db.query(Product)).filter(Product.id == product.id).first()
-    return success_response(_serialize_product(product), 201)
-
-
-@admin_router.get("/products/{product_id}")
-def admin_show(product_id: int, db: Session = Depends(get_db), _: User = Depends(get_current_admin)):
-    product = _with_variants(db.query(Product)).filter(Product.id == product_id).first()
-    if product is None:
-        return error_response("محصول پیدا نشد", 404)
-    return success_response(_serialize_product(product))
-
-
-@admin_router.put("/products/{product_id}")
-@admin_router.post("/products/{product_id}")
-def admin_update(
-    product_id: int,
-    name: str = Form(...),
-    category_id: int = Form(...),
-    description: str = Form(...),
-    status: int = Form(1),
-    price: int | None = Form(None),
-    quantity: int | None = Form(None),
-    sale_price: int | None = Form(None),
-    date_on_sale_from: str | None = Form(None),
-    date_on_sale_to: str | None = Form(None),
-    primary_image: UploadFile | None = File(None),
-    images: list[UploadFile] | None = File(None),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_admin),
-):
-    """Accepts both PUT and POST (some clients spoof PUT via a _method form field)."""
-    product = db.query(Product).filter(Product.id == product_id).first()
-    if product is None:
-        return error_response("محصول پیدا نشد", 404)
-
-    if primary_image is not None:
-        product.primary_image = save_upload(primary_image, IMAGE_SUBDIR)
-
-    if name != product.name:
-        product.slug = make_unique_product_slug(db, name)
-    product.name = name
-    product.category_id = category_id
-    product.description = description
-    product.status = status
-    if price is not None:
-        product.price = price
-    if quantity is not None:
-        product.quantity = quantity
-    if sale_price is not None:
-        product.sale_price = sale_price
-    if date_on_sale_from is not None:
-        product.date_on_sale_from = datetime.fromisoformat(date_on_sale_from) if date_on_sale_from else None
-    if date_on_sale_to is not None:
-        product.date_on_sale_to = datetime.fromisoformat(date_on_sale_to) if date_on_sale_to else None
-
-    if images:
-        for old_image in list(product.images):
-            db.delete(old_image)
-        db.flush()
-        for image in images:
-            db.add(ProductImage(product_id=product.id, image=save_upload(image, IMAGE_SUBDIR)))
-
-    db.commit()
-    product = _with_variants(db.query(Product)).filter(Product.id == product_id).first()
-    return success_response(_serialize_product(product))
-
-
-@admin_router.delete("/products/{product_id}")
-def admin_destroy(product_id: int, db: Session = Depends(get_db), _: User = Depends(get_current_admin)):
-    product = db.query(Product).filter(Product.id == product_id).first()
-    if product is None:
-        return error_response("محصول پیدا نشد", 404)
-    # Soft delete (not db.delete()): products already have order_items
-    # pointing at them once they've ever been ordered, and product_id there
-    # is NOT NULL - a hard delete makes SQLAlchemy try to null that column
-    # out before removing the row, which fails with an IntegrityError (500).
-    # Soft-deleting also preserves order history, matching SoftDeleteMixin's
-    # intent everywhere else in this codebase.
-    product.deleted_at = datetime.utcnow()
-    db.commit()
-    return success_response({"data": ["deleted"]})
-
-
-# ---------------------------------------------------------------------------
-# Colors / sizes - standalone CRUD (separate from inline creation on the
-# product itself, for managing variants on an existing product)
-# ---------------------------------------------------------------------------
-
-@admin_router.post("/products/{product_id}/colors")
-def admin_add_color(
-    product_id: int,
-    name: str = Form(...),
-    color_code: str = Form(...),
-    image: UploadFile = File(...),
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_admin),
-):
-    product = db.query(Product).filter(Product.id == product_id).first()
-    if product is None:
-        return error_response("محصول پیدا نشد", 404)
-
-    color = ProductColor(
-        product_id=product_id,
-        name=name,
-        color_code=color_code,
-        image=save_upload(image, IMAGE_SUBDIR),
-    )
-    db.add(color)
-    db.commit()
-    db.refresh(color)
-    return success_response(_serialize_color(color), 201)
-
-
-@admin_router.delete("/products/{product_id}/colors/{color_id}")
-def admin_delete_color(
-    product_id: int,
-    color_id: int,
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_admin),
-):
-    color = (
-        db.query(ProductColor)
-        .filter(ProductColor.id == color_id, ProductColor.product_id == product_id)
-        .first()
-    )
-    if color is None:
-        return error_response("رنگ پیدا نشد", 404)
-    # Soft delete for the same reason as admin_destroy above: this color's
-    # sizes reference it with a NOT NULL product_color_id.
-    color.deleted_at = datetime.utcnow()
-    db.commit()
-    return success_response({"data": ["deleted"]})
-
-
-@admin_router.post("/products/{product_id}/colors/{color_id}/sizes")
-def admin_add_size(
-    product_id: int,
-    color_id: int,
-    payload: ProductSizeIn,
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_admin),
-):
-    color = (
-        db.query(ProductColor)
-        .filter(ProductColor.id == color_id, ProductColor.product_id == product_id)
-        .first()
-    )
-    if color is None:
-        return error_response("رنگ پیدا نشد", 404)
-
-    size = ProductSize(
-        product_color_id=color_id,
-        size=payload.size,
-        price=payload.price,
-        quantity=payload.quantity,
-    )
-    db.add(size)
-    db.commit()
-    db.refresh(size)
-    return success_response(_serialize_size(size), 201)
-
-
-@admin_router.put("/products/{product_id}/colors/{color_id}/sizes/{size_id}")
-def admin_update_size(
-    product_id: int,
-    color_id: int,
-    size_id: int,
-    payload: ProductSizeIn,
-    db: Session = Depends(get_db),
-    _: User = Depends(get_current_admin),
-):
-    size = (
-        db.query(ProductSize)
-        .join(ProductColor)
-        .filter(
-            ProductSize.id == size_id,
-            ProductSize.product_color_id == color_id,
-            ProductColor.product_id == product_id,
         )
-        .first()
-    )
-    if size is None:
-        return error_response("سایز پیدا نشد", 404)
-
-    size.size = payload.size
-    size.price = payload.price
-    size.quantity = payload.quantity
     db.commit()
-    return success_response(_serialize_size(size))
+
+    cart = _get_or_create_cart(db, current_user)
+    return success_response(_serialize_cart(cart), 201)
 
 
-@admin_router.delete("/products/{product_id}/colors/{color_id}/sizes/{size_id}")
-def admin_delete_size(
-    product_id: int,
-    color_id: int,
-    size_id: int,
+@router.patch("/items/{item_id}")
+def update_item(
+    item_id: int,
+    payload: CartItemUpdate,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_admin),
+    current_user: User = Depends(get_current_user),
 ):
-    size = (
-        db.query(ProductSize)
-        .join(ProductColor)
-        .filter(
-            ProductSize.id == size_id,
-            ProductSize.product_color_id == color_id,
-            ProductColor.product_id == product_id,
-        )
-        .first()
-    )
-    if size is None:
-        return error_response("سایز پیدا نشد", 404)
-    size.deleted_at = datetime.utcnow()
+    cart = _get_or_create_cart(db, current_user)
+    item = next((i for i in cart.items if i.id == item_id), None)
+    if item is None:
+        return error_response("آیتم سبد خرید پیدا نشد", 404)
+
+    if payload.quantity < 1:
+        return error_response({"quantity": ["تعداد باید حداقل ۱ باشد"]}, 422)
+
+    item.quantity = payload.quantity
     db.commit()
-    return success_response({"data": ["deleted"]})
+
+    cart = _get_or_create_cart(db, current_user)
+    return success_response(_serialize_cart(cart))
+
+
+@router.delete("/items/{item_id}")
+def remove_item(
+    item_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    cart = _get_or_create_cart(db, current_user)
+    item = next((i for i in cart.items if i.id == item_id), None)
+    if item is None:
+        return error_response("آیتم سبد خرید پیدا نشد", 404)
+
+    db.delete(item)
+    db.commit()
+
+    cart = _get_or_create_cart(db, current_user)
+    return success_response(_serialize_cart(cart))
+
+
+@router.delete("")
+def clear_cart(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    cart = _get_or_create_cart(db, current_user)
+    for item in list(cart.items):
+        db.delete(item)
+    db.commit()
+    return success_response({"data": ["cart cleared"]})
