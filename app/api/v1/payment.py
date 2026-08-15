@@ -4,16 +4,25 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session, joinedload
 
 from app.api.deps import get_current_user
+from app.api.v1.products import _is_on_sale
 from app.core.config import settings
 from app.db.session import get_db
 from app.models import (
-    Cart, Coupon, Order, OrderItems, ProductSize, ShippingMethod, Transaction, User, UserAddress,
+    Cart, Coupon, Order, OrderItems, Product, ProductSize, ShippingMethod, Transaction, User, UserAddress,
 )
 from app.schemas.payment import PaymentSendIn, PaymentVerifyIn
 from app.services.zibal import zibal
 from app.utils.response import success_response, error_response
 
 router = APIRouter(tags=["payment"])
+
+
+def _checkout_unit_price(product: Product, size: ProductSize | None) -> int:
+    """Same discount logic as the cart endpoints (app/api/v1/cart.py's
+    _unit_price) - kept here too since checkout recomputes prices from the
+    DB independently rather than trusting the cart's cached values."""
+    base = size.price if size is not None else (product.price or 0)
+    return product.sale_price if _is_on_sale(product) else base
 
 
 @router.post("/payment/send")
@@ -54,12 +63,21 @@ def send(
     # validate stock + compute total from current DB prices (never trust cached cart prices)
     total_amount = 0
     for item in cart.items:
-        size = db.query(ProductSize).filter(ProductSize.id == item.product_size_id).first()
-        if size is None:
-            return error_response({"error": [f"سایز انتخاب‌شده دیگر موجود نیست"]}, 422)
-        if size.quantity < item.quantity:
-            return error_response({"error": [f"موجودی سایز {size.size} کافی نیست"]}, 422)
-        total_amount += size.price * item.quantity
+        if item.product_size_id is not None:
+            size = db.query(ProductSize).filter(ProductSize.id == item.product_size_id).first()
+            if size is None:
+                return error_response({"error": [f"سایز انتخاب‌شده دیگر موجود نیست"]}, 422)
+            if size.quantity < item.quantity:
+                return error_response({"error": [f"موجودی سایز {size.size} کافی نیست"]}, 422)
+            product = size.color.product
+        else:
+            size = None
+            product = db.query(Product).filter(Product.id == item.product_id).first()
+            if product is None:
+                return error_response({"error": ["محصول انتخاب‌شده دیگر موجود نیست"]}, 422)
+            if (product.quantity or 0) < item.quantity:
+                return error_response({"error": [f"موجودی {product.name} کافی نیست"]}, 422)
+        total_amount += _checkout_unit_price(product, size) * item.quantity
 
     coupon = None
     coupon_amount = 0
