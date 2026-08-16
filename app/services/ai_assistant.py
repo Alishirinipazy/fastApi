@@ -1,6 +1,7 @@
 import json
 
 import httpx
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -12,9 +13,38 @@ ANTHROPIC_VERSION = "2023-06-01"
 GAPGPT_URL = "https://api.gapgpt.app/v1/chat/completions"
 IMAGE_SUBDIR = "products"
 MAX_TOOL_ROUNDS = 5
+REQUEST_TIMEOUT = 25.0
+
+
+class AssistantUnavailable(Exception):
+    """Raised when the underlying AI provider can't be reached / errors out
+    after retrying - caught by run_assistant's callers to return a graceful
+    Persian message instead of a raw 500."""
+
+
+def _post_with_retry(url: str, headers: dict, payload: dict) -> dict:
+    """
+    POSTs to the AI provider with one retry on transient network failures
+    (timeout / connection error) - a single hiccup shouldn't kill the whole
+    turn. Does NOT retry on 4xx/5xx from the provider itself (rate limits,
+    bad request, etc.) since retrying those immediately rarely helps and
+    just adds latency; those are raised straight away.
+    """
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            response = httpx.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            return response.json()
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as exc:
+            last_error = exc
+            continue  # one retry for network-level issues only
+        except httpx.HTTPStatusError as exc:
+            raise AssistantUnavailable(f"provider returned {exc.response.status_code}") from exc
+    raise AssistantUnavailable("provider unreachable after retry") from last_error
 
 SYSTEM_PROMPT = """\
-اسم تو پازیه، دستیار خرید هوشمند فروشگاه اسلیپر استوره. وظیفه‌ات کمک به مشتری برای پیدا کردن و خرید محصول مناسبه، مخصوصاً راهنمایی سایز.
+اسم تو پازیه، دستیار خرید هوشمند فروشگاه اسلیپر پازه. وظیفه‌ات کمک به مشتری برای پیدا کردن و خرید محصول مناسبه، مخصوصاً راهنمایی سایز.
 
 قوانین مهم:
 - هیچ‌وقت قیمت، موجودی، رنگ یا سایز رو از خودت نساز - همیشه از ابزارهای search_products یا get_product_details استفاده کن و فقط بر اساس نتیجه‌شون جواب بده.
@@ -68,25 +98,39 @@ TOOLS = [
 
 
 def _run_search_products(db: Session, args: dict) -> dict:
-    query = db.query(Product).filter(Product.status == 1)
+    def build_query():
+        q = db.query(Product).filter(Product.status == 1)
+        if args.get("query"):
+            term = f"%{args['query'].strip()}%"
+            q = q.filter(or_(Product.name.ilike(term), Product.description.ilike(term)))
+        if args.get("color"):
+            q = q.join(Product.colors).filter(ProductColor.name.ilike(f"%{args['color']}%")).distinct()
+        if args.get("size"):
+            q = (
+                q.join(Product.colors)
+                .join(ProductColor.sizes)
+                .filter(ProductSize.size == args["size"])
+                .distinct()
+            )
+        if args.get("max_price"):
+            q = q.join(Product.colors).join(ProductColor.sizes).filter(
+                ProductSize.price <= args["max_price"]
+            ).distinct()
+        return q
 
-    if args.get("query"):
-        query = query.filter(Product.name.ilike(f"%{args['query'].strip()}%"))
-    if args.get("color"):
-        query = query.join(Product.colors).filter(ProductColor.name.ilike(f"%{args['color']}%")).distinct()
-    if args.get("size"):
-        query = (
-            query.join(Product.colors)
-            .join(ProductColor.sizes)
-            .filter(ProductSize.size == args["size"])
-            .distinct()
-        )
-    if args.get("max_price"):
-        query = query.join(Product.colors).join(ProductColor.sizes).filter(
-            ProductSize.price <= args["max_price"]
-        ).distinct()
+    products = build_query().limit(8).all()
 
-    products = query.limit(8).all()
+    # اگه با همه‌ی فیلترها چیزی پیدا نشد، فقط با متن آزاد (بدون رنگ/سایز/قیمت)
+    # دوباره بگرد - همیشه دست‌خالی برنگرده، حداقل چیز نزدیک رو نشون بده.
+    fallback_used = False
+    if not products and (args.get("color") or args.get("size") or args.get("max_price")):
+        q = db.query(Product).filter(Product.status == 1)
+        if args.get("query"):
+            term = f"%{args['query'].strip()}%"
+            q = q.filter(or_(Product.name.ilike(term), Product.description.ilike(term)))
+        products = q.limit(8).all()
+        fallback_used = bool(products)
+
     return {
         "results": [
             {
@@ -98,7 +142,8 @@ def _run_search_products(db: Session, args: dict) -> dict:
                 "image": image_url(p.primary_image, IMAGE_SUBDIR),
             }
             for p in products
-        ]
+        ],
+        "note": "دقیقاً با این رنگ/سایز/قیمت چیزی نبود؛ این‌ها نزدیک‌ترین موارد بر اساس متن جستجو هستن." if fallback_used else None,
     }
 
 
@@ -250,8 +295,18 @@ def run_assistant(
         system_prompt += f"\n\nمشتری الان توی صفحه محصول با slug \"{product_slug}\" هست - اگه سوالش درباره همین محصوله، با get_product_details جزئیاتش رو بگیر."
 
     if settings.AI_PROVIDER == "gapgpt":
-        return _run_gapgpt(db, current_user, messages, system_prompt)
-    return _run_anthropic(db, current_user, messages, system_prompt)
+        runner = _run_gapgpt
+    else:
+        runner = _run_anthropic
+
+    try:
+        return runner(db, current_user, messages, system_prompt)
+    except AssistantUnavailable:
+        return {
+            "reply": "دستیار هوشمند الان در دسترس نیست، چند لحظه دیگه دوباره امتحان کن 🙏",
+            "cart_updated": False,
+            "products": [],
+        }
 
 
 def _run_anthropic(db: Session, current_user: User | None, messages: list[dict], system_prompt: str) -> dict:
@@ -273,20 +328,17 @@ def _run_anthropic(db: Session, current_user: User | None, messages: list[dict],
     }
 
     for _ in range(MAX_TOOL_ROUNDS):
-        response = httpx.post(
+        data = _post_with_retry(
             ANTHROPIC_URL,
-            headers=headers,
-            json={
+            headers,
+            {
                 "model": settings.AI_ASSISTANT_MODEL,
                 "max_tokens": settings.AI_ASSISTANT_MAX_TOKENS,
                 "system": system_prompt,
                 "messages": conversation,
                 "tools": TOOLS,
             },
-            timeout=30.0,
         )
-        response.raise_for_status()
-        data = response.json()
 
         content = data.get("content", [])
         conversation.append({"role": "assistant", "content": content})
@@ -349,21 +401,21 @@ def _run_gapgpt(db: Session, current_user: User | None, messages: list[dict], sy
     }
 
     for _ in range(MAX_TOOL_ROUNDS):
-        response = httpx.post(
+        data = _post_with_retry(
             GAPGPT_URL,
-            headers=headers,
-            json={
+            headers,
+            {
                 "model": settings.GAPGPT_MODEL,
                 "messages": conversation,
                 "tools": _openai_tools(),
                 "max_tokens": settings.AI_ASSISTANT_MAX_TOKENS,
             },
-            timeout=30.0,
         )
-        response.raise_for_status()
-        data = response.json()
 
-        message = data["choices"][0]["message"]
+        try:
+            message = data["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise AssistantUnavailable("unexpected response shape from gapgpt") from exc
         conversation.append(message)
 
         tool_calls = message.get("tool_calls")
