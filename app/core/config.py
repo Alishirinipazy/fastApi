@@ -35,6 +35,22 @@ class Settings(BaseSettings):
 
     CORS_ORIGINS: str = "https://slipperpaz.ir"
 
+    # Tapin (تاپین) shipping/logistics API - api.tapin.ir/api/v2/public/.
+    # Both values come from the Tapin dashboard: منوی یکپارچه‌سازی > مدیریت
+    # توکن (enter your server's IP + panel password there to generate them).
+    # This is a static, long-lived credential - not something fetched via
+    # a login API call.
+    TAPIN_TOKEN: str = ""
+    TAPIN_SHOP_ID: str = ""
+    # پیش‌فرض‌هایی که برای استعلام قیمت/ثبت خودکار سفارش لازمه چون هیچ محصولی
+    # وزن/ابعاد واقعی ثبت‌شده نداره. box_id رو از GET /admin-panel/tapin/packing-boxes
+    # بگیرید و اینجا بذارید؛ TAPIN_ITEM_WEIGHT_GRAMS هم تخمین وزن هر عدد کالاست
+    # (برای دمپایی/کفش چیزی حدود ۳۰۰-۵۰۰ گرم منطقیه) - تا وقتی وزن واقعی به
+    # مدل Product اضافه نشده، این تنها تخمینیه که داریم.
+    TAPIN_DEFAULT_BOX_ID: int = 0
+    TAPIN_ITEM_WEIGHT_GRAMS: int = 400
+    TAPIN_PACKET_TYPE: int = 2  # 1=پاکت 2=بسته 3=پاکت جوف
+
     # Absolute path where uploaded images/files are written. Leave empty to
     # default to <project_root>/storage (fine for local dev). In production
     # this MUST match the mount path of the persistent volume attached to

@@ -19,6 +19,7 @@ from app.api.v1.stories import router as stories_router, admin_router as stories
 from app.api.v1.users import admin_router as users_admin_router
 from app.api.v1.contact import router as contact_router, admin_router as contact_admin_router
 from app.api.v1.chat import router as chat_router
+from app.api.v1.tapin import router as tapin_router, admin_router as tapin_admin_router
 from app.core.config import settings
 
 app = FastAPI(title=settings.APP_NAME, debug=settings.APP_DEBUG)
@@ -60,6 +61,8 @@ app.include_router(users_admin_router, prefix="/api/v1")
 app.include_router(contact_router, prefix="/api/v1")
 app.include_router(contact_admin_router, prefix="/api/v1")
 app.include_router(chat_router, prefix="/api/v1")
+app.include_router(tapin_router, prefix="/api/v1")
+app.include_router(tapin_admin_router, prefix="/api/v1")
 
 
 @app.get("/api/v1/health")

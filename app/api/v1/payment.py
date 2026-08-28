@@ -5,12 +5,15 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.api.deps import get_current_user
 from app.api.v1.products import _is_on_sale
+from app.api.v1.tapin import cart_to_tapin_products, _split_name
 from app.core.config import settings
 from app.db.session import get_db
 from app.models import (
     Cart, Coupon, Order, OrderItems, Product, ProductSize, ShippingMethod, Transaction, User, UserAddress,
 )
 from app.schemas.payment import PaymentSendIn, PaymentVerifyIn
+from app.services import tapin
+from app.services.tapin import TapinError
 from app.services.zibal import zibal
 from app.utils.response import success_response, error_response
 
@@ -49,16 +52,22 @@ def send(
     if cart is None or not cart.items:
         return error_response({"error": ["سبد خرید شما خالی است"]}, 422)
 
-    if db.query(UserAddress).filter(UserAddress.id == payload.address_id).first() is None:
+    address = db.query(UserAddress).filter(UserAddress.id == payload.address_id).first()
+    if address is None:
         return error_response({"error": ["آدرس وارد شده حذف یا وجود ندارد"]}, 422)
 
-    shipping = (
-        db.query(ShippingMethod)
-        .filter(ShippingMethod.id == payload.shipping_method_id, ShippingMethod.is_active.is_(True))
-        .first()
-    )
-    if shipping is None:
-        return error_response({"error": ["روش ارسال انتخاب‌شده فعال نیست"]}, 422)
+    if not payload.tapin_order_type and not payload.shipping_method_id:
+        return error_response({"error": ["روش ارسال را انتخاب کنید"]}, 422)
+
+    shipping = None
+    if payload.shipping_method_id:
+        shipping = (
+            db.query(ShippingMethod)
+            .filter(ShippingMethod.id == payload.shipping_method_id, ShippingMethod.is_active.is_(True))
+            .first()
+        )
+        if shipping is None:
+            return error_response({"error": ["روش ارسال انتخاب‌شده فعال نیست"]}, 422)
 
     # validate stock + compute total from current DB prices (never trust cached cart prices)
     total_amount = 0
@@ -101,7 +110,32 @@ def send(
 
         coupon_amount = (total_amount * coupon.percentage) // 100
 
-    shipping_amount = shipping.price
+    shipping_amount = shipping.price if shipping else None
+    if payload.tapin_order_type:
+        products, weight = cart_to_tapin_products(cart.items)
+        first_name, last_name = _split_name(current_user.name)
+        try:
+            entries = tapin.check_price(
+                address=address.address,
+                city_code=address.city_id,
+                province_code=address.province_id,
+                first_name=first_name,
+                last_name=last_name,
+                mobile=address.cellphone,
+                postal_code=address.postal_code,
+                pay_type=1,
+                order_type=payload.tapin_order_type,
+                packet_type=settings.TAPIN_PACKET_TYPE,
+                box_id=settings.TAPIN_DEFAULT_BOX_ID,
+                package_weight=weight,
+                products=products,
+            )
+        except TapinError as exc:
+            return error_response({"error": [f"خطا در استعلام قیمت ارسال: {exc}"]}, 422)
+        shipping_amount = entries.get("total_price") or entries.get("send_price")
+        if not shipping_amount:
+            return error_response({"error": ["قیمت ارسال برای این مقصد دریافت نشد"]}, 422)
+
     paying_amount = (total_amount - coupon_amount) + shipping_amount
 
     result = zibal.request(
@@ -121,6 +155,7 @@ def send(
         user_id=current_user.id,
         address_id=payload.address_id,
         shipping_method_id=payload.shipping_method_id,
+        tapin_order_type=payload.tapin_order_type,
         coupon_id=coupon.id if coupon else None,
         order_status=0,  # pending payment
         total_amount=total_amount,
@@ -132,15 +167,21 @@ def send(
     db.flush()  # get order.id without committing yet
 
     for item in cart.items:
-        size = db.query(ProductSize).filter(ProductSize.id == item.product_size_id).first()
+        if item.product_size_id is not None:
+            size = db.query(ProductSize).filter(ProductSize.id == item.product_size_id).first()
+            product = size.color.product
+        else:
+            size = None
+            product = db.query(Product).filter(Product.id == item.product_id).first()
+        unit_price = _checkout_unit_price(product, size)
         db.add(OrderItems(
             order_id=order.id,
             product_id=item.product_id,
             product_color_id=item.product_color_id,
             product_size_id=item.product_size_id,
-            price=size.price,
+            price=unit_price,
             quantity=item.quantity,
-            subtotal=size.price * item.quantity,
+            subtotal=unit_price * item.quantity,
         ))
 
     # Zibal's trackId is an integer; stored as text in the same `token`
@@ -189,6 +230,42 @@ def verify(payload: PaymentVerifyIn, db: Session = Depends(get_db)):
             size = db.query(ProductSize).filter(ProductSize.id == item.product_size_id).first()
             if size:
                 size.quantity = max(0, size.quantity - item.quantity)
+        else:
+            product = db.query(Product).filter(Product.id == item.product_id).first()
+            if product:
+                product.quantity = max(0, (product.quantity or 0) - item.quantity)
+
+    # اگه مشتری موقع تسویه‌حساب یکی از روش‌های ارسال تاپین رو انتخاب کرده،
+    # همین الان سفارش رو در تاپین ثبت می‌کنیم تا بارکد واقعی صادر بشه.
+    # عمداً توی try/except جداگونه‌ست: اگه تاپین خطا بده یا در دسترس نباشه،
+    # نباید جلوی موفقیت پرداخت/سفارش رو بگیره - فقط پیام خطا ذخیره می‌شه تا
+    # از پنل ادمین دستی دوباره امتحان بشه.
+    if order.tapin_order_type:
+        try:
+            address = order.address
+            first_name, last_name = _split_name(order.user.name)
+            products, weight = cart_to_tapin_products(order.items)
+            entries = tapin.register_order(
+                manual_id=str(order.id),
+                register_type=1,
+                address=address.address,
+                city_code=address.city_id,
+                province_code=address.province_id,
+                first_name=first_name,
+                last_name=last_name,
+                mobile=address.cellphone,
+                postal_code=address.postal_code,
+                pay_type=1,
+                order_type=order.tapin_order_type,
+                packet_type=settings.TAPIN_PACKET_TYPE,
+                box_id=settings.TAPIN_DEFAULT_BOX_ID,
+                package_weight=weight,
+                products=products,
+            )
+            order.tapin_order_id = str(entries.get("order_id") or entries.get("id") or "")
+            order.tapin_barcode = entries.get("barcode")
+        except TapinError as exc:
+            order.tapin_register_error = str(exc)[:255]
 
     # empty the cart now that it's turned into a paid order
     cart = db.query(Cart).filter(Cart.user_id == order.user_id).first()
