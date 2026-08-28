@@ -132,7 +132,8 @@ def send(
             )
         except TapinError as exc:
             return error_response({"error": [f"خطا در استعلام قیمت ارسال: {exc}"]}, 422)
-        shipping_amount = entries.get("total_price") or entries.get("send_price")
+        raw_price = entries.get("total_price") or entries.get("send_price")
+        shipping_amount = raw_price // 10 if raw_price else None  # تاپین ریال برمی‌گردونه، اینجا تومانه
         if not shipping_amount:
             return error_response({"error": ["قیمت ارسال برای این مقصد دریافت نشد"]}, 422)
 

@@ -1,4 +1,4 @@
-from sqlalchemy import ForeignKey, Integer, SmallInteger
+from sqlalchemy import ForeignKey, Integer, SmallInteger, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.session import Base
@@ -20,6 +20,13 @@ class Order(Base, TimestampMixin, SoftDeleteMixin):
     shipping_method_id: Mapped[int | None] = mapped_column(
         ForeignKey("shipping_methods.id", ondelete="SET NULL"), nullable=True
     )
+
+    # روش ارسال تاپین که مشتری موقع تسویه‌حساب انتخاب کرده (1=پیشتاز 3=ویژه
+    # 5=اکسپرس) - وقتی پر باشه، بعد از پرداخت موفق خودکار در تاپین ثبت می‌شه.
+    tapin_order_type: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tapin_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    tapin_barcode: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    tapin_register_error: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     # legacy generic status field kept from the original schema
     status: Mapped[int] = mapped_column(SmallInteger, default=0)

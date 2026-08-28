@@ -3,7 +3,11 @@ from pydantic import BaseModel
 
 class PaymentSendIn(BaseModel):
     address_id: int
-    shipping_method_id: int
+    # یکی از این دو باید پر باشه: یا انتخاب لجستیک تاپین (روش جدید و اصلی)،
+    # یا شناسه‌ی روش ارسال ثابت قدیمی (برای سازگاری، اگه جایی هنوز ازش
+    # استفاده می‌شه).
+    tapin_order_type: int | None = None
+    shipping_method_id: int | None = None
     coupon: str | None = None
 
 
