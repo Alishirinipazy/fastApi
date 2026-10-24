@@ -1,11 +1,12 @@
 import json
+import re
 
 import httpx
-from sqlalchemy import or_
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.models import Product, ProductColor, ProductSize, Cart, CartItem, User
+from app.models import Product, ProductColor, ProductSize, Cart, CartItem, Category, User
 from app.services.storage import image_url
 
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
@@ -55,19 +56,29 @@ SYSTEM_PROMPT = """\
 - اگه ابزار add_to_cart جواب داد که کاربر لاگین نیست، بهش بگو باید اول وارد حساب کاربریش بشه.
 - هیچ‌وقت وانمود نکن که سفارش رو نهایی کردی یا پرداختی انجام شده - فقط افزودن به سبد خرید در توان توئه.
 - اگه سوال کاملاً خارج از حوزه فروشگاه بود، مودبانه برگرد به موضوع خرید.
+- هدفت اینه مشتری خیلی راحت چیزی که می‌خواد رو پیدا کنه: اگه درخواستش کلیه (مثلاً «یه دمپایی می‌خوام»)، یک سوال کوتاه بپرس (برای چه کسی؟ بودجه؟ رنگ؟) و هم‌زمان چند گزینه نشون بده. وقتی محصولی پیدا کردی، حداکثر ۴ تا رو معرفی کن؛ کارت‌های محصول خودکار زیر پیامت نشون داده می‌شن، پس مشخصات رو تکرار نکن.
+- اگه محصولی تخفیف داره (on_sale)، حتماً درصد تخفیفش رو بگو. اگه مشتری ارزون‌تر، پرفروش‌تر یا تخفیف‌دار خواست، از پارامتر sort و on_sale_only ابزار search_products استفاده کن.
+- به مشتری بگو روی هر کارت محصول دکمه «پرو مجازی» هست و می‌تونه عکس خودش رو بذاره و ببینه محصول بهش میاد یا نه.
 """
 
 TOOLS = [
     {
         "name": "search_products",
-        "description": "جستجوی محصولات فروشگاه بر اساس متن آزاد، دسته‌بندی، رنگ، سایز یا سقف قیمت. همیشه قبل از معرفی هر محصولی این رو صدا بزن.",
+        "description": "جستجوی محصولات فروشگاه بر اساس متن آزاد، دسته‌بندی، رنگ، سایز، سقف قیمت و مرتب‌سازی. همیشه قبل از معرفی هر محصولی این رو صدا بزن.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "متن جستجو، مثلا 'دمپایی خونگی' یا خالی برای همه"},
+                "category": {"type": "string", "description": "نام دسته‌بندی، مثلا 'بچگانه'، اختیاری"},
                 "color": {"type": "string", "description": "نام رنگ مورد نظر، اختیاری"},
                 "size": {"type": "string", "description": "سایز مورد نظر، اختیاری"},
                 "max_price": {"type": "integer", "description": "سقف قیمت به تومان، اختیاری"},
+                "sort": {
+                    "type": "string",
+                    "enum": ["newest", "cheapest", "expensive", "bestseller", "discount"],
+                    "description": "مرتب‌سازی نتایج؛ پیش‌فرض newest",
+                },
+                "on_sale_only": {"type": "boolean", "description": "فقط محصولات تخفیف‌دار"},
             },
         },
     },
@@ -97,78 +108,137 @@ TOOLS = [
 ]
 
 
+def _product_card(serialized: dict) -> dict:
+    """The slim shape the chat widget renders (and the model reads) for a product,
+    built from the same serializer the storefront uses so price / discount /
+    stock always match what the product page shows."""
+    return {
+        "id": serialized["id"],
+        "slug": serialized["slug"],
+        "name": serialized["name"],
+        "category": serialized["category"],
+        "image": serialized["primary_image"],
+        "min_price": serialized["regular_price"],
+        "regular_price": serialized["regular_price"],
+        "final_price": serialized["final_price"],
+        "on_sale": serialized["on_sale"],
+        "discount_percent": serialized["discount_percent"],
+        "in_stock": serialized["total_quantity"] > 0,
+        "colors": [
+            {"name": c["name"], "color_code": c["color_code"]} for c in serialized["colors"]
+        ][:6],
+    }
+
+
 def _run_search_products(db: Session, args: dict) -> dict:
-    def build_query():
-        q = db.query(Product).filter(Product.status == 1)
-        if args.get("query"):
-            term = f"%{args['query'].strip()}%"
-            q = q.filter(or_(Product.name.ilike(term), Product.description.ilike(term)))
+    # Imported here: products.py is an API module, and importing it at module
+    # load would couple the two files' import order for no benefit.
+    from app.api.v1 import products as catalog
+
+    def candidates(query_text: str | None, require_all: bool, category_ids: list[int] | None):
+        q = catalog._with_variants(catalog._active_products(db)).filter(Product.status == 1)
+        if category_ids:
+            q = q.filter(Product.category_id.in_(category_ids))
+        tokens = [t for t in re.split(r"\s+", (query_text or "").strip()) if t]
+        if tokens:
+            conds = [
+                or_(Product.name.ilike(f"%{t}%"), Product.description.ilike(f"%{t}%"))
+                for t in tokens
+            ]
+            q = q.filter(and_(*conds) if require_all else or_(*conds))
+        return q.order_by(Product.created_at.desc()).limit(80).all()
+
+    category_ids: list[int] | None = None
+    if args.get("category"):
+        cats = db.query(Category).filter(Category.name.ilike(f"%{args['category'].strip()}%")).all()
+        if cats:
+            category_ids = []
+            for c in cats:
+                category_ids += catalog._category_and_descendant_ids(db, c.id)
+
+    def passes_filters(p: Product) -> bool:
+        colors = catalog._active_colors(p)
         if args.get("color"):
-            q = q.join(Product.colors).filter(ProductColor.name.ilike(f"%{args['color']}%")).distinct()
+            wanted = args["color"].strip()
+            if not any(wanted in c.name for c in colors):
+                return False
         if args.get("size"):
-            q = (
-                q.join(Product.colors)
-                .join(ProductColor.sizes)
-                .filter(ProductSize.size == args["size"])
-                .distinct()
-            )
+            wanted = str(args["size"]).strip()
+            if not any(
+                s.size == wanted and s.deleted_at is None and s.quantity > 0
+                for c in colors
+                for s in c.sizes
+            ):
+                return False
         if args.get("max_price"):
-            q = q.join(Product.colors).join(ProductColor.sizes).filter(
-                ProductSize.price <= args["max_price"]
-            ).distinct()
-        return q
+            if catalog._serialize_product(p)["final_price"] > int(args["max_price"]):
+                return False
+        if args.get("on_sale_only") and not catalog._is_on_sale(p):
+            return False
+        return True
 
-    products = build_query().limit(8).all()
+    query_text = args.get("query")
+    products = [p for p in candidates(query_text, True, category_ids) if passes_filters(p)]
+    # Several words that don't ALL appear in one product ("دمپایی خونگی نرم")
+    # shouldn't return nothing - fall back to any-word matching.
+    if not products and query_text and len(query_text.split()) > 1:
+        products = [p for p in candidates(query_text, False, category_ids) if passes_filters(p)]
 
-    # اگه با همه‌ی فیلترها چیزی پیدا نشد، فقط با متن آزاد (بدون رنگ/سایز/قیمت)
-    # دوباره بگرد - همیشه دست‌خالی برنگرده، حداقل چیز نزدیک رو نشون بده.
     fallback_used = False
-    if not products and (args.get("color") or args.get("size") or args.get("max_price")):
-        q = db.query(Product).filter(Product.status == 1)
-        if args.get("query"):
-            term = f"%{args['query'].strip()}%"
-            q = q.filter(or_(Product.name.ilike(term), Product.description.ilike(term)))
-        products = q.limit(8).all()
+    has_filters = any(args.get(k) for k in ("color", "size", "max_price", "on_sale_only"))
+    if not products and has_filters:
+        # Nothing matches every filter: show the closest by text/category only,
+        # so the customer is never left with an empty answer.
+        products = candidates(query_text, True, category_ids)
         fallback_used = bool(products)
 
+    cards = [(_p, _product_card(catalog._serialize_product(_p))) for _p in products]
+
+    sort = args.get("sort") or "newest"
+    if sort == "cheapest":
+        cards.sort(key=lambda pc: pc[1]["final_price"])
+    elif sort == "expensive":
+        cards.sort(key=lambda pc: pc[1]["final_price"], reverse=True)
+    elif sort == "discount":
+        cards.sort(key=lambda pc: pc[1]["discount_percent"], reverse=True)
+    elif sort == "bestseller":
+        rank = {pid: i for i, pid in enumerate(catalog._bestseller_ids(db, 200))}
+        cards.sort(key=lambda pc: rank.get(pc[1]["id"], len(rank)))
+    # in-stock products first, otherwise keep the chosen order (sort is stable)
+    cards.sort(key=lambda pc: not pc[1]["in_stock"])
+
     return {
-        "results": [
-            {
-                "id": p.id,
-                "slug": p.slug,
-                "name": p.name,
-                "min_price": p.min_price,
-                "in_stock": p.total_quantity > 0,
-                "image": image_url(p.primary_image, IMAGE_SUBDIR),
-            }
-            for p in products
-        ],
-        "note": "دقیقاً با این رنگ/سایز/قیمت چیزی نبود؛ این‌ها نزدیک‌ترین موارد بر اساس متن جستجو هستن." if fallback_used else None,
+        "results": [card for _, card in cards[:8]],
+        "note": "دقیقاً با این فیلترها چیزی نبود؛ این‌ها نزدیک‌ترین موارد بر اساس متن جستجو هستن." if fallback_used else None,
     }
 
 
 def _run_get_product_details(db: Session, args: dict) -> dict:
-    product = db.query(Product).filter(Product.slug == args.get("slug", "")).first()
+    from app.api.v1 import products as catalog
+
+    product = (
+        catalog._with_variants(catalog._active_products(db))
+        .filter(Product.slug == args.get("slug", ""))
+        .first()
+    )
     if product is None:
         return {"error": "محصول با این slug پیدا نشد"}
 
+    serialized = catalog._serialize_product(product)
     return {
-        "id": product.id,
-        "slug": product.slug,
-        "name": product.name,
-        "description": product.description,
-        "image": image_url(product.primary_image, IMAGE_SUBDIR),
+        **_product_card(serialized),
+        "description": serialized["description"],
         "colors": [
             {
-                "id": c.id,
-                "name": c.name,
-                "color_code": c.color_code,
+                "id": c["id"],
+                "name": c["name"],
+                "color_code": c["color_code"],
                 "sizes": [
-                    {"id": s.id, "size": s.size, "price": s.price, "quantity": s.quantity}
-                    for s in c.sizes
+                    {"id": s["id"], "size": s["size"], "price": s["price"], "quantity": s["quantity"]}
+                    for s in c["sizes"]
                 ],
             }
-            for c in product.colors
+            for c in serialized["colors"]
         ],
     }
 
@@ -246,14 +316,14 @@ def _track_tool_result(name: str, result: dict, products_by_id: dict[int, dict])
         for p in result.get("results", []):
             products_by_id[p["id"]] = p
     if name == "get_product_details" and "id" in result:
-        products_by_id[result["id"]] = {
-            "id": result["id"],
-            "slug": result["slug"],
-            "name": result["name"],
-            "image": result["image"],
-            "min_price": min((s["price"] for c in result["colors"] for s in c["sizes"]), default=0),
-            "in_stock": any(s["quantity"] > 0 for c in result["colors"] for s in c["sizes"]),
-        }
+        card = {k: result[k] for k in (
+            "id", "slug", "name", "category", "image", "min_price", "regular_price",
+            "final_price", "on_sale", "discount_percent", "in_stock",
+        ) if k in result}
+        card["colors"] = [
+            {"name": c["name"], "color_code": c["color_code"]} for c in result.get("colors", [])
+        ][:6]
+        products_by_id[result["id"]] = card
     return name == "add_to_cart" and bool(result.get("success"))
 
 
@@ -300,13 +370,30 @@ def run_assistant(
         runner = _run_anthropic
 
     try:
-        return runner(db, current_user, messages, system_prompt)
+        result = runner(db, current_user, messages, system_prompt)
     except AssistantUnavailable:
-        return {
+        result = {
             "reply": "دستیار هوشمند الان در دسترس نیست، چند لحظه دیگه دوباره امتحان کن 🙏",
             "cart_updated": False,
             "products": [],
         }
+    result["quick_replies"] = _quick_replies(result)
+    return result
+
+
+def _quick_replies(result: dict) -> list[str]:
+    """Follow-up chips shown under the assistant's reply, so the customer can
+    narrow the choice with one tap instead of typing."""
+    products = result.get("products") or []
+    if not products:
+        return []
+    chips = ["ارزون‌ترین‌هاشون رو نشون بده", "پرفروش‌ترین‌ها کدومان؟"]
+    if any(p.get("on_sale") for p in products):
+        chips.insert(0, "فقط تخفیف‌دارها")
+    else:
+        chips.insert(0, "تخفیف‌دارها رو نشون بده")
+    chips.append("رنگ‌های دیگه دارید؟")
+    return chips[:4]
 
 
 def _run_anthropic(db: Session, current_user: User | None, messages: list[dict], system_prompt: str) -> dict:

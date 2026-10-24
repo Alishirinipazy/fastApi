@@ -192,6 +192,60 @@ def list_products(request: Request, page: int = 1, db: Session = Depends(get_db)
     return success_response({"products": [_serialize_product(p) for p in items], "links": links, "meta": meta})
 
 
+def _bestseller_ids(db: Session, limit: int) -> list[int]:
+    """Product ids ranked by units sold across paid orders (best first)."""
+    rows = (
+        db.query(OrderItems.product_id, func.sum(OrderItems.quantity).label("sold"))
+        .join(Order, Order.id == OrderItems.order_id)
+        .filter(Order.payment_status == 1)
+        .group_by(OrderItems.product_id)
+        .order_by(func.sum(OrderItems.quantity).desc())
+        .limit(limit)
+        .all()
+    )
+    return [r.product_id for r in rows]
+
+
+@router.get("/products/featured")
+def featured_products(limit: int = 8, db: Session = Depends(get_db)):
+    """
+    Curated home-page groups: currently discounted products, best sellers and
+    newest arrivals. Each group is capped at `limit` (max 16). Best sellers
+    fall back to the newest products when nothing has been sold yet, so the
+    group is never empty on a fresh shop.
+    """
+    limit = max(1, min(limit, 16))
+    base = _with_variants(_active_products(db)).filter(Product.status == 1)
+
+    newest = base.order_by(Product.created_at.desc()).limit(limit).all()
+
+    now = datetime.utcnow()
+    sale_candidates = (
+        base.filter(Product.sale_price > 0)
+        .order_by(Product.created_at.desc())
+        .limit(limit * 3)
+        .all()
+    )
+    on_sale = [p for p in sale_candidates if _is_on_sale(p, now)][:limit]
+    on_sale.sort(
+        key=lambda p: (_serialize_product(p)["discount_percent"]),
+        reverse=True,
+    )
+
+    best_ids = _bestseller_ids(db, limit)
+    if best_ids:
+        by_id = {p.id: p for p in base.filter(Product.id.in_(best_ids)).all()}
+        bestsellers = [by_id[i] for i in best_ids if i in by_id]
+    else:
+        bestsellers = newest
+
+    return success_response({
+        "sale": [_serialize_product(p) for p in on_sale],
+        "bestsellers": [_serialize_product(p) for p in bestsellers],
+        "newest": [_serialize_product(p) for p in newest],
+    })
+
+
 @router.get("/products/products-tabs")
 def products_tabs(db: Session = Depends(get_db)):
     categories = db.query(Category).all()
