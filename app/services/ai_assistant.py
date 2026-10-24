@@ -1,3 +1,4 @@
+import logging
 import json
 import re
 
@@ -15,6 +16,9 @@ GAPGPT_URL = "https://api.gapgpt.app/v1/chat/completions"
 IMAGE_SUBDIR = "products"
 MAX_TOOL_ROUNDS = 5
 REQUEST_TIMEOUT = 25.0
+
+
+logger = logging.getLogger(__name__)
 
 
 class AssistantUnavailable(Exception):
@@ -41,7 +45,9 @@ def _post_with_retry(url: str, headers: dict, payload: dict) -> dict:
             last_error = exc
             continue  # one retry for network-level issues only
         except httpx.HTTPStatusError as exc:
+            logger.error("AI provider %s -> HTTP %s: %s", url, exc.response.status_code, exc.response.text[:500])
             raise AssistantUnavailable(f"provider returned {exc.response.status_code}") from exc
+    logger.error("AI provider %s unreachable: %r", url, last_error)
     raise AssistantUnavailable("provider unreachable after retry") from last_error
 
 SYSTEM_PROMPT = """\
@@ -371,7 +377,8 @@ def run_assistant(
 
     try:
         result = runner(db, current_user, messages, system_prompt)
-    except AssistantUnavailable:
+    except AssistantUnavailable as exc:
+        logger.error("AI assistant unavailable (provider=%s): %s", settings.AI_PROVIDER, exc)
         result = {
             "reply": "دستیار هوشمند الان در دسترس نیست، چند لحظه دیگه دوباره امتحان کن 🙏",
             "cart_updated": False,
