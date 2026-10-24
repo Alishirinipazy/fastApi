@@ -109,16 +109,21 @@ def generate(photo_png: bytes, product_png: bytes, prompt: str) -> str:
         raise TryOnError("پروب مجازی هنوز راه‌اندازی نشده (کلید API تنظیم نشده).", 503)
 
     try:
-        response = httpx.post(
-            settings.TRYON_IMAGES_URL,
-            headers={"Authorization": f"Bearer {settings.GAPGPT_API_KEY}"},
-            data={"model": settings.TRYON_MODEL, "prompt": prompt, "n": "1", "size": "1024x1024"},
-            files=[
-                ("image[]", ("photo.png", photo_png, "image/png")),
-                ("image[]", ("product.png", product_png, "image/png")),
-            ],
-            timeout=REQUEST_TIMEOUT,
-        )
+        for attempt in range(2):  # one retry on a transient 5xx from the provider
+            response = httpx.post(
+                settings.TRYON_IMAGES_URL,
+                headers={"Authorization": f"Bearer {settings.GAPGPT_API_KEY}"},
+                data={"model": settings.TRYON_MODEL, "prompt": prompt, "n": "1", "size": "1024x1024"},
+                files=[
+                    ("image[]", ("photo.png", photo_png, "image/png")),
+                    ("image[]", ("product.png", product_png, "image/png")),
+                ],
+                timeout=REQUEST_TIMEOUT,
+            )
+            if response.status_code in (502, 503, 504) and attempt == 0:
+                time.sleep(2)
+                continue
+            break
         response.raise_for_status()
         item = response.json()["data"][0]
     except (httpx.TimeoutException, httpx.ConnectError) as exc:
