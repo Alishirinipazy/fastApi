@@ -73,7 +73,16 @@ class Settings(BaseSettings):
 
     @property
     def cors_origins_list(self) -> list[str]:
-        return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
+        # Tolerant parsing: accepts "a,b", '["a","b"]' or "[a,b]" (with stray
+        # quotes/brackets/spaces/trailing slashes) - a browser's Origin header
+        # never has a trailing slash, so one in .env would silently never match.
+        raw = self.CORS_ORIGINS.strip().strip("[]")
+        origins = []
+        for item in raw.replace("\n", ",").split(","):
+            item = item.strip().strip("\"'").strip().rstrip("/")
+            if item:
+                origins.append(item)
+        return origins
 
     @property
     def sqlalchemy_database_url(self) -> str:
