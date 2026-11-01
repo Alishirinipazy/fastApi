@@ -59,6 +59,9 @@ class Settings(BaseSettings):
     # مدل Product اضافه نشده، این تنها تخمینیه که داریم.
     TAPIN_DEFAULT_BOX_ID: int = 0
     TAPIN_ITEM_WEIGHT_GRAMS: int = 400
+    # JSON list overriding the customer-facing Tapin options, e.g.
+    # [{"order_type":1,"carrier":"پست پیشتاز","title":"پیشتاز","eta":"۳ تا ۵ روز"}]
+    TAPIN_TIERS: str = ""
     TAPIN_PACKET_TYPE: int = 2  # 1=پاکت 2=بسته 3=پاکت جوف
 
     # Absolute path where uploaded images/files are written. Leave empty to

@@ -1,3 +1,5 @@
+import json
+
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session, joinedload
@@ -6,7 +8,7 @@ from app.api.deps import get_current_admin, get_current_user
 from app.api.v1.products import _is_on_sale
 from app.core.config import settings
 from app.db.session import get_db
-from app.models import Cart, Order, Product, ProductSize, User, UserAddress
+from app.models import Cart, Order, Product, ProductSize, ShippingMethod, User, UserAddress
 from app.services import tapin
 from app.services.tapin import TapinError
 from app.utils.response import success_response, error_response
@@ -17,14 +19,57 @@ admin_router = APIRouter(prefix="/admin-panel/tapin", tags=["admin-tapin"])
 # order_type گزینه‌هایی که به مشتری نشون داده می‌شن، با عنوان فارسی و
 # تخمین زمان تحویل - این‌ها ثابت‌های خودِ تاپینن، نه چیزی که ما تعریف کنیم.
 SHIPPING_TIERS = [
-    # این زمان‌ها مستقیم از توضیحات SLA مستندات تاپینه - خودِ اندپوینت
-    # check-price هیچ فیلد زمان تحویلی برنمی‌گردونه (فقط اجزای قیمت)، پس
-    # این تنها منبعیه که داریم؛ اگه توی پنل تاپین چیزی به‌روزتر دیدید،
-    # همینجا عوض کنید.
-    {"order_type": 1, "title": "پیشتاز", "eta": "۳ تا ۵ روز کاری"},
-    {"order_type": 3, "title": "ویژه", "eta": "حدود ۲۴ ساعت"},
-    {"order_type": 5, "title": "اکسپرس", "eta": "۲ تا ۳ روز کاری"},
+    # carrier = نام شرکت حمل‌کننده که به مشتری نشون داده می‌شه. فقط order_type=1
+    # (پست پیشتاز) از مستندات تاپین قطعیه؛ برای ۳ و ۵ مطمئن نیستیم کدوم سرویس
+    # (پست ویژه/تیپاکس/...) هستن، پس اسم دقیقشون رو از پنل تاپین ببینید و با
+    # متغیر TAPIN_TIERS توی .env عوض کنید (مثال توی .env.example هست).
+    {"order_type": 1, "carrier": "پست پیشتاز", "title": "پیشتاز", "eta": "۳ تا ۵ روز کاری"},
+    {"order_type": 3, "carrier": "", "title": "ویژه", "eta": "حدود ۲۴ ساعت"},
+    {"order_type": 5, "carrier": "", "title": "اکسپرس", "eta": "۲ تا ۳ روز کاری"},
 ]
+
+
+def _shipping_tiers() -> list[dict]:
+    """SHIPPING_TIERS, replaced by the TAPIN_TIERS env JSON when it is set and valid."""
+    raw = (settings.TAPIN_TIERS or "").strip()
+    if not raw:
+        return SHIPPING_TIERS
+    try:
+        tiers = json.loads(raw)
+        return [
+            {
+                "order_type": int(t["order_type"]),
+                "carrier": str(t.get("carrier", "")),
+                "title": str(t.get("title") or t.get("carrier") or t["order_type"]),
+                "eta": str(t.get("eta", "")),
+            }
+            for t in tiers
+        ]
+    except (ValueError, KeyError, TypeError):
+        return SHIPPING_TIERS
+
+
+def _own_methods(db: Session) -> list[dict]:
+    """Shop's own shipping methods (admin-managed ShippingMethod rows) as checkout options."""
+    methods = (
+        db.query(ShippingMethod)
+        .filter(ShippingMethod.is_active.is_(True))
+        .order_by(ShippingMethod.price)
+        .all()
+    )
+    return [
+        {
+            "key": f"own-{m.id}",
+            "kind": "own",
+            "order_type": None,
+            "shipping_method_id": m.id,
+            "carrier": "ارسال فروشگاه",
+            "title": m.name,
+            "eta": f"{m.delivery_days} روز کاری" if m.delivery_days else "",
+            "price": m.price,
+        }
+        for m in methods
+    ]
 
 
 def _split_name(full_name: str | None) -> tuple[str, str]:
@@ -127,7 +172,7 @@ def shipping_options(
 
     options = []
     errors = []
-    for tier in SHIPPING_TIERS:
+    for tier in _shipping_tiers():
         try:
             entries = tapin.check_price(
                 address=address.address,
@@ -146,7 +191,11 @@ def shipping_options(
             )
             raw_price = entries.get("total_price") or entries.get("send_price") or 0
             options.append({
+                "key": f"tapin-{tier['order_type']}",
+                "kind": "tapin",
                 "order_type": tier["order_type"],
+                "shipping_method_id": None,
+                "carrier": tier["carrier"],
                 "title": tier["title"],
                 "eta": tier["eta"],
                 "price": raw_price // 10,  # تاپین قیمت رو به ریال برمی‌گردونه؛ همه‌جای این پروژه تومانه
@@ -155,6 +204,9 @@ def shipping_options(
             # یه تعرفه ممکنه برای این مقصد اصلاً پشتیبانی نشه - رد می‌شیم،
             # نه این‌که کل لیست رو خراب کنیم.
             errors.append(f"{tier['title']}: {exc}")
+
+    # ارسال‌های خود فروشگاه همیشه کنار گزینه‌های تاپین هستن، حتی اگه تاپین خطا بده
+    options.extend(_own_methods(db))
 
     if not options:
         return error_response("در حال حاضر امکان ارسال به این آدرس وجود ندارد: " + "؛ ".join(errors), 502)
