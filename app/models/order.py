@@ -11,8 +11,9 @@ class Order(Base, TimestampMixin, SoftDeleteMixin):
     id: Mapped[int] = mapped_column(primary_key=True)
 
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
-    address_id: Mapped[int] = mapped_column(
-        ForeignKey("user_addresses.id", ondelete="CASCADE")
+    # nullable: in-store (POS) sales are handed over at the counter - no address
+    address_id: Mapped[int | None] = mapped_column(
+        ForeignKey("user_addresses.id", ondelete="CASCADE"), nullable=True
     )
     coupon_id: Mapped[int | None] = mapped_column(
         ForeignKey("coupons.id", ondelete="CASCADE"), nullable=True
@@ -27,6 +28,12 @@ class Order(Base, TimestampMixin, SoftDeleteMixin):
     tapin_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     tapin_barcode: Mapped[str | None] = mapped_column(String(64), nullable=True)
     tapin_register_error: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # 'online' (website) | 'pos' (in-store, paid on the card reader)
+    sales_channel: Mapped[str] = mapped_column(String(16), default="online", server_default="online")
+    payment_method: Mapped[str] = mapped_column(String(16), default="gateway", server_default="gateway")
+    pos_reference: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    cashier_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # legacy generic status field kept from the original schema
     status: Mapped[int] = mapped_column(SmallInteger, default=0)
