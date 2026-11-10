@@ -292,6 +292,8 @@ def register_order(
         return error_response("سفارش پیدا نشد", 404)
 
     address = order.address
+    if address is None:
+        return error_response("این سفارش حضوری است و آدرس ارسال ندارد", 422)
     first_name, last_name = _split_name(order.user.name)
     products, _weight = cart_to_tapin_products(order.items)
 

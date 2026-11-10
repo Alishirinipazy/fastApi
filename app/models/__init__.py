@@ -13,6 +13,7 @@ from app.models.order import Order, OrderItems
 from app.models.transaction import Transaction
 from app.models.content import ContactUs, Slider, Story
 from app.models.cart import Cart, CartItem
+from app.models.tryon import TryOnUsage
 
 __all__ = [
     "User",
@@ -35,4 +36,5 @@ __all__ = [
     "Story",
     "Cart",
     "CartItem",
+    "TryOnUsage",
 ]

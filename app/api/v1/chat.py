@@ -1,7 +1,9 @@
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user_optional
+from fastapi.responses import JSONResponse
+
+from app.api.deps import get_current_user, get_current_user_optional
 from app.db.session import get_db
 from app.models import User
 from app.schemas.chat import ChatRequest
@@ -31,6 +33,17 @@ def chat(
     return success_response(result)
 
 
+@router.get("/chat/try-on/status")
+def try_on_status(
+    db: Session = Depends(get_db),
+    current_user: User | None = Depends(get_current_user_optional),
+):
+    """Tells the UI whether the AI try-on is available to this visitor right now."""
+    if current_user is None:
+        return success_response({"logged_in": False, "remaining": 0})
+    return success_response({"logged_in": True, "remaining": 0 if try_on.used_today(db, current_user.id) else 1})
+
+
 @router.post("/chat/try-on")
 def virtual_try_on(
     request: Request,
@@ -38,11 +51,14 @@ def virtual_try_on(
     color_id: int | None = Form(None),
     photo: UploadFile = File(...),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
     Virtual try-on: shows the chosen product on the customer's own photo.
-    Guests can use it too; it is rate-limited per client IP because every
-    call costs an image-generation request.
+
+    Login required, and each user gets ONE AI try-on per day (Iran time) -
+    every call costs an image-generation request. After that the frontend
+    offers its free manual mode. A failed generation does not use up the try.
     """
     forwarded = request.headers.get("x-forwarded-for", "")
     client_key = forwarded.split(",")[0].strip() or (request.client.host if request.client else "unknown")
@@ -59,6 +75,7 @@ def virtual_try_on(
 
     color = next((c for c in catalog._active_colors(product) if c.id == color_id), None)
 
+    # validate and prepare everything cheap first, so a bad photo never burns the daily try
     try:
         photo_png = try_on.prepare_photo(photo.file.read())
         # when the customer picked a color, that color's own photo is the best reference
@@ -66,8 +83,23 @@ def virtual_try_on(
         prompt = try_on.build_prompt(
             product.name, product.category.name if product.category else None, color.name if color else None
         )
-        image = try_on.generate(photo_png, product_png, prompt)
     except try_on.TryOnError as exc:
         return error_response(exc.message, exc.status)
+
+    if not try_on.reserve_daily_slot(db, current_user.id):
+        return JSONResponse(status_code=429, content={
+            "status": "error",
+            "message": "پرو هوشمند امروزت رو استفاده کردی؛ فردا دوباره می‌تونی. تا اون موقع دستی پرو کن.",
+            "data": {"reason": "daily_limit"},
+        })
+
+    try:
+        image = try_on.generate(photo_png, product_png, prompt)
+    except try_on.TryOnError as exc:
+        try_on.release_daily_slot(db, current_user.id)
+        return error_response(exc.message, exc.status)
+    except Exception:
+        try_on.release_daily_slot(db, current_user.id)
+        raise
 
     return success_response({"image": image})
