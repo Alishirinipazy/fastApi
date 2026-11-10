@@ -6,6 +6,7 @@ from sqlalchemy import engine_from_config, pool
 from app.core.config import settings
 from app.db.session import Base
 import app.models  # noqa: F401 - registers all tables on Base.metadata
+from sqlalchemy import text
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.sqlalchemy_database_url)
@@ -37,6 +38,7 @@ def run_migrations_online() -> None:
     with connectable.connect() as connection:
         context.configure(connection=connection, target_metadata=target_metadata)
         with context.begin_transaction():
+            connection.execute(text("SET SESSION default_storage_engine=InnoDB"))
             context.run_migrations()
 
 
