@@ -36,10 +36,12 @@ class Settings(BaseSettings):
     # Virtual try-on (POST /chat/try-on): sends the customer's photo plus the
     # product image to an OpenAI-compatible image-edit endpoint (GapGPT by
     # default, using GAPGPT_API_KEY above). Each call costs money, so it is
-    # rate-limited per client IP. Set TRYON_ENABLED=false to switch it off.
+    # limited to ONE AI try-on per logged-in user per day (Iran time); after that the
+    # customer uses the manual mode. TRYON_RATE_LIMIT is only an extra per-IP abuse guard.
+    # Set TRYON_ENABLED=false to switch it off.
     TRYON_ENABLED: bool = True
     TRYON_IMAGES_URL: str = "https://api.gapgpt.app/v1/images/edits"
-    TRYON_MODEL: str = "gpt-image-1"
+    TRYON_MODEL: str = "gapgpt/qwen-image-2.1"
     TRYON_RATE_LIMIT: int = 5
     TRYON_RATE_WINDOW_SECONDS: int = 600
 

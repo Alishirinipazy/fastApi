@@ -10,12 +10,16 @@ import io
 import logging
 import time
 from collections import defaultdict, deque
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import httpx
 from PIL import Image, ImageOps
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.models import TryOnUsage
 from app.services.storage import STORAGE_ROOT
 
 MAX_PHOTO_BYTES = 8 * 1024 * 1024
@@ -33,6 +37,34 @@ class TryOnError(Exception):
         super().__init__(message)
         self.message = message
         self.status = status
+
+
+IRAN_OFFSET = timedelta(hours=3, minutes=30)
+
+
+def iran_today() -> date:
+    return (datetime.utcnow() + IRAN_OFFSET).date()
+
+
+def used_today(db: Session, user_id: int) -> bool:
+    return db.query(TryOnUsage).filter(TryOnUsage.user_id == user_id, TryOnUsage.day == iran_today()).first() is not None
+
+
+def reserve_daily_slot(db: Session, user_id: int) -> bool:
+    """Takes today's single AI try-on. False if already taken (also when two requests race)."""
+    db.add(TryOnUsage(user_id=user_id, day=iran_today()))
+    try:
+        db.commit()
+        return True
+    except IntegrityError:
+        db.rollback()
+        return False
+
+
+def release_daily_slot(db: Session, user_id: int) -> None:
+    """Gives the slot back when generation failed - a provider error must not cost the customer their try."""
+    db.query(TryOnUsage).filter(TryOnUsage.user_id == user_id, TryOnUsage.day == iran_today()).delete()
+    db.commit()
 
 
 # --- per-IP rate limit (in-memory: per worker process, resets on restart) ---
@@ -109,19 +141,26 @@ def generate(photo_png: bytes, product_png: bytes, prompt: str) -> str:
         raise TryOnError("پروب مجازی هنوز راه‌اندازی نشده (کلید API تنظیم نشده).", 503)
 
     try:
-        for attempt in range(2):  # one retry on a transient 5xx from the provider
-            response = httpx.post(
-                settings.TRYON_IMAGES_URL,
-                headers={"Authorization": f"Bearer {settings.GAPGPT_API_KEY}"},
-                data={"model": settings.TRYON_MODEL, "prompt": prompt, "n": "1", "size": "1024x1024"},
-                files=[
-                    ("image[]", ("photo.png", photo_png, "image/png")),
-                    ("image[]", ("product.png", product_png, "image/png")),
-                ],
-                timeout=REQUEST_TIMEOUT,
-            )
-            if response.status_code in (502, 503, 504) and attempt == 0:
-                time.sleep(2)
+        # OpenAI-style multi-image edits use "image[]"; some gateways/models want repeated "image".
+        # A 400/422 means the request was rejected (nothing generated or charged), so try the other spelling.
+        for field in ("image[]", "image"):
+            for attempt in range(2):  # one retry on a transient 5xx from the provider
+                response = httpx.post(
+                    settings.TRYON_IMAGES_URL,
+                    headers={"Authorization": f"Bearer {settings.GAPGPT_API_KEY}"},
+                    data={"model": settings.TRYON_MODEL, "prompt": prompt, "n": "1", "size": "1024x1024"},
+                    files=[
+                        (field, ("photo.png", photo_png, "image/png")),
+                        (field, ("product.png", product_png, "image/png")),
+                    ],
+                    timeout=REQUEST_TIMEOUT,
+                )
+                if response.status_code in (502, 503, 504) and attempt == 0:
+                    time.sleep(2)
+                    continue
+                break
+            if response.status_code in (400, 422) and field == "image[]":
+                logger.warning("Try-on rejected field spelling '%s' (HTTP %s): %s", field, response.status_code, response.text[:300])
                 continue
             break
         response.raise_for_status()
